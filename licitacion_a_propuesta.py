@@ -112,7 +112,10 @@ def _prompt_matriz(seccion, requisitos):
 
 # Límite de caracteres al re-inyectar requisitos en un prompt (evita que el
 # prompt crezca tanto que NotebookLM devuelva una respuesta vacía).
-_MAX_CTX = 6000
+_MAX_CTX = 4000
+# Tope mucho más chico para el reintento de rescate, cuando ya fallaron varios
+# intentos con el contexto normal.
+_MAX_CTX_RESCATE = 1800
 # Máximo de secciones a procesar (cota de seguridad para no dispararse).
 _MAX_SECCIONES = 20
 
@@ -266,16 +269,82 @@ def _parsear_indice(texto):
 # Pipeline contra NotebookLM
 # --------------------------------------------------------------------------- #
 
+def _leer_si_existe(ruta):
+    p = Path(ruta)
+    if p.exists() and p.stat().st_size > 0:
+        return p.read_text(encoding="utf-8")
+    return None
+
+
+def _leer_cuerpo_checkpoint(ruta):
+    """Lee un checkpoint y devuelve el contenido sin el encabezado '# Sección'."""
+    texto = _leer_si_existe(ruta)
+    if texto is None:
+        return None
+    lineas = texto.splitlines()
+    if lineas and lineas[0].startswith("# "):
+        # Saltamos el encabezado y la línea en blanco que le sigue.
+        return "\n".join(lineas[2:] if len(lineas) > 1 and lineas[1] == "" else lineas[1:])
+    return texto
+
+
+async def _ask_con_rescate(client, nb_id, mensaje_normal, mensaje_rescate):
+    """Intenta el prompt normal; si falla, hace un último intento con uno más chico."""
+    try:
+        return await _ask(client, nb_id, mensaje_normal)
+    except Exception as exc:
+        print(f"  ⚠ falló con contexto normal ({exc}); rescate con contexto reducido...")
+        await asyncio.sleep(5)
+        return await _ask(client, nb_id, mensaje_rescate, intentos=2)
+
+
 async def _ejecutar_pipeline(documentos, nombre_notebook, carpeta, on_progress):
-    """Corre el pipeline completo en un único notebook y devuelve los textos."""
+    """Corre el pipeline reanudando desde checkpoints existentes."""
     ckpt = Path(carpeta) / "checkpoints"
     (ckpt / "01_requisitos").mkdir(parents=True, exist_ok=True)
     (ckpt / "02_propuesta").mkdir(parents=True, exist_ok=True)
     (ckpt / "03_matriz").mkdir(parents=True, exist_ok=True)
 
+    # ------------------------------------------------------------------ #
+    # Pre-escaneo de checkpoints: ¿qué hay que pedirle a NotebookLM?
+    # ------------------------------------------------------------------ #
+    lista_items = _leer_si_existe(ckpt / "00_lista_items.md")
+    indice_raw = _leer_si_existe(ckpt / "00_indice_secciones.md")
+    resumen = _leer_si_existe(ckpt / "04_resumen.md")
+    secciones = _parsear_indice(indice_raw) if indice_raw else None
+
+    def _ruta_seccion(idx, seccion, sub):
+        slug = f"{idx + 1:02d}_{_sanitizar(seccion)[:40]}"
+        return ckpt / sub / f"{slug}.md"
+
+    # ¿Necesitamos abrir el notebook? Solo si falta cualquier salida.
+    necesita_chat = lista_items is None or indice_raw is None or resumen is None
+    if secciones:
+        for i, s in enumerate(secciones):
+            if (_leer_cuerpo_checkpoint(_ruta_seccion(i, s, "01_requisitos")) is None
+                    or _leer_cuerpo_checkpoint(_ruta_seccion(i, s, "02_propuesta")) is None
+                    or _leer_cuerpo_checkpoint(_ruta_seccion(i, s, "03_matriz")) is None):
+                necesita_chat = True
+                break
+    else:
+        necesita_chat = True
+
+    if not necesita_chat:
+        print("→ Todos los checkpoints presentes: se ensambla sin tocar NotebookLM.")
+        on_progress(95, "Reanudando desde checkpoints")
+        datos = [{
+            "seccion": s,
+            "requisitos": _leer_cuerpo_checkpoint(_ruta_seccion(i, s, "01_requisitos")),
+            "propuesta": _leer_cuerpo_checkpoint(_ruta_seccion(i, s, "02_propuesta")),
+            "matriz": _leer_cuerpo_checkpoint(_ruta_seccion(i, s, "03_matriz")),
+        } for i, s in enumerate(secciones)]
+        return {"lista_items": lista_items, "resumen": resumen, "secciones": datos}
+
+    # ------------------------------------------------------------------ #
+    # Abrimos el cliente y ejecutamos solo lo que falta.
+    # ------------------------------------------------------------------ #
     cliente_cm = await _abrir_cliente()
     async with cliente_cm as client:
-        # Fase 0: notebook + subida de documentos.
         on_progress(5, "Creando notebook")
         nb = await client.notebooks.create(nombre_notebook)
         print(f"  notebook id: {nb.id}")
@@ -291,44 +360,92 @@ async def _ejecutar_pipeline(documentos, nombre_notebook, carpeta, on_progress):
             await client.sources.wait_until_ready(nb.id, source.id)
 
         # Fase 1: lista completa de ítems.
-        on_progress(32, "Extrayendo la lista de ítems de la licitación")
-        lista_items = await _ask(client, nb.id, MENSAJE_LISTA)
-        (ckpt / "00_lista_items.md").write_text(lista_items, encoding="utf-8")
+        if lista_items is None:
+            on_progress(32, "Extrayendo la lista de ítems de la licitación")
+            lista_items = await _ask(client, nb.id, MENSAJE_LISTA)
+            (ckpt / "00_lista_items.md").write_text(lista_items, encoding="utf-8")
+        else:
+            print("✓ checkpoint: lista de ítems (saltando)")
+            on_progress(32, "Lista de ítems (desde checkpoint)")
 
         # Fase 2: índice de secciones.
-        on_progress(38, "Determinando las secciones de la propuesta")
-        indice_raw = await _ask(client, nb.id, MENSAJE_INDICE)
-        (ckpt / "00_indice_secciones.md").write_text(indice_raw, encoding="utf-8")
-        secciones = _parsear_indice(indice_raw)
+        if indice_raw is None:
+            on_progress(38, "Determinando las secciones de la propuesta")
+            indice_raw = await _ask(client, nb.id, MENSAJE_INDICE)
+            (ckpt / "00_indice_secciones.md").write_text(indice_raw, encoding="utf-8")
+            secciones = _parsear_indice(indice_raw)
+        else:
+            print("✓ checkpoint: índice de secciones (saltando)")
+
         if not secciones:
             secciones = ["Propuesta técnica general"]
         print(f"  secciones detectadas: {len(secciones)}")
 
         # Fases 3-5: por cada sección, requisitos + propuesta + matriz.
         datos = []
+        fallos = []
         n = len(secciones)
-        # Repartimos el progreso 40..90 entre las secciones.
         for idx, seccion in enumerate(secciones):
             base = 40 + int(50 * idx / n)
-            slug = f"{idx + 1:02d}_{_sanitizar(seccion)[:40]}"
+            ruta_req = _ruta_seccion(idx, seccion, "01_requisitos")
+            ruta_prop = _ruta_seccion(idx, seccion, "02_propuesta")
+            ruta_mat = _ruta_seccion(idx, seccion, "03_matriz")
 
-            on_progress(base, f"Requisitos: {seccion}")
-            print(f"→ [{idx+1}/{n}] Requisitos: {seccion}")
-            requisitos = await _ask(client, nb.id, _prompt_requisitos(seccion))
-            (ckpt / "01_requisitos" / f"{slug}.md").write_text(
-                f"# {seccion}\n\n{requisitos}", encoding="utf-8")
+            requisitos = _leer_cuerpo_checkpoint(ruta_req)
+            if requisitos is None:
+                on_progress(base, f"Requisitos: {seccion}")
+                print(f"→ [{idx+1}/{n}] Requisitos: {seccion}")
+                try:
+                    requisitos = await _ask(client, nb.id, _prompt_requisitos(seccion))
+                    ruta_req.write_text(f"# {seccion}\n\n{requisitos}", encoding="utf-8")
+                except Exception as exc:
+                    print(f"  ✗ requisitos fallaron: {exc}")
+                    fallos.append((seccion, "requisitos", str(exc)))
+                    datos.append({"seccion": seccion, "requisitos": None,
+                                  "propuesta": None, "matriz": None})
+                    continue
+            else:
+                print(f"✓ [{idx+1}/{n}] requisitos (desde checkpoint): {seccion}")
 
-            on_progress(base + 3, f"Propuesta: {seccion}")
-            print(f"→ [{idx+1}/{n}] Propuesta: {seccion}")
-            propuesta = await _ask(client, nb.id, _prompt_propuesta(seccion, requisitos))
-            (ckpt / "02_propuesta" / f"{slug}.md").write_text(
-                f"# {seccion}\n\n{propuesta}", encoding="utf-8")
+            propuesta = _leer_cuerpo_checkpoint(ruta_prop)
+            if propuesta is None:
+                on_progress(base + 3, f"Propuesta: {seccion}")
+                print(f"→ [{idx+1}/{n}] Propuesta: {seccion}")
+                try:
+                    propuesta = await _ask_con_rescate(
+                        client, nb.id,
+                        _prompt_propuesta(seccion, requisitos),
+                        _prompt_propuesta(
+                            seccion,
+                            _truncar(requisitos, _MAX_CTX_RESCATE)),
+                    )
+                    ruta_prop.write_text(f"# {seccion}\n\n{propuesta}", encoding="utf-8")
+                except Exception as exc:
+                    print(f"  ✗ propuesta falló incluso con rescate: {exc}")
+                    fallos.append((seccion, "propuesta", str(exc)))
+                    propuesta = None
+            else:
+                print(f"✓ [{idx+1}/{n}] propuesta (desde checkpoint): {seccion}")
 
-            on_progress(base + 6, f"Matriz: {seccion}")
-            print(f"→ [{idx+1}/{n}] Matriz: {seccion}")
-            matriz = await _ask(client, nb.id, _prompt_matriz(seccion, requisitos))
-            (ckpt / "03_matriz" / f"{slug}.md").write_text(
-                f"# {seccion}\n\n{matriz}", encoding="utf-8")
+            matriz = _leer_cuerpo_checkpoint(ruta_mat)
+            if matriz is None:
+                on_progress(base + 6, f"Matriz: {seccion}")
+                print(f"→ [{idx+1}/{n}] Matriz: {seccion}")
+                try:
+                    matriz = await _ask_con_rescate(
+                        client, nb.id,
+                        _prompt_matriz(seccion, requisitos),
+                        _prompt_matriz(
+                            seccion,
+                            _truncar(requisitos, _MAX_CTX_RESCATE)),
+                    )
+                    ruta_mat.write_text(f"# {seccion}\n\n{matriz}", encoding="utf-8")
+                except Exception as exc:
+                    print(f"  ✗ matriz falló incluso con rescate: {exc}")
+                    fallos.append((seccion, "matriz", str(exc)))
+                    matriz = None
+            else:
+                print(f"✓ [{idx+1}/{n}] matriz (desde checkpoint): {seccion}")
 
             datos.append({
                 "seccion": seccion,
@@ -338,9 +455,25 @@ async def _ejecutar_pipeline(documentos, nombre_notebook, carpeta, on_progress):
             })
 
         # Fase 6: resumen ejecutivo.
-        on_progress(92, "Redactando el resumen ejecutivo")
-        resumen = await _ask(client, nb.id, MENSAJE_RESUMEN)
-        (ckpt / "04_resumen.md").write_text(resumen, encoding="utf-8")
+        if resumen is None:
+            on_progress(92, "Redactando el resumen ejecutivo")
+            try:
+                resumen = await _ask(client, nb.id, MENSAJE_RESUMEN)
+                (ckpt / "04_resumen.md").write_text(resumen, encoding="utf-8")
+            except Exception as exc:
+                print(f"  ✗ resumen falló: {exc}")
+                resumen = "_Resumen ejecutivo no disponible (falló su generación)._"
+                fallos.append(("(resumen ejecutivo)", "resumen", str(exc)))
+        else:
+            print("✓ checkpoint: resumen ejecutivo (saltando)")
+
+        if fallos:
+            print("\n⚠ Pipeline completado con fallos parciales:")
+            for s, etapa, err in fallos:
+                print(f"   - {s} [{etapa}]: {err}")
+            (ckpt / "_fallos.md").write_text(
+                "\n".join(f"- **{s}** [{e}]: {er}" for s, e, er in fallos),
+                encoding="utf-8")
 
         return {"lista_items": lista_items, "resumen": resumen, "secciones": datos}
 
@@ -371,11 +504,15 @@ async def generar_propuesta(documentos, output_root=OUTPUT_ROOT, on_progress=_no
     on_progress(95, "Generando documentos .docx")
     fecha = _dt.date.today().strftime("%d/%m/%Y")
 
+    sin_dato = "_Esta sección no se pudo generar en esta ejecución. " \
+               "Re-ejecutar el proceso para reintentarla; el resto se conserva " \
+               "desde los checkpoints._"
+
     # Propuesta técnica: resumen ejecutivo + propuesta de cada sección.
-    cuerpo_propuesta = ["## Resumen ejecutivo", res["resumen"], ""]
+    cuerpo_propuesta = ["## Resumen ejecutivo", res["resumen"] or sin_dato, ""]
     for d in res["secciones"]:
         cuerpo_propuesta.append(f"## {d['seccion']}")
-        cuerpo_propuesta.append(d["propuesta"])
+        cuerpo_propuesta.append(d["propuesta"] or sin_dato)
         cuerpo_propuesta.append("")
     ruta_propuesta = carpeta / f"Propuesta_Tecnica_{lic}.docx"
     guardar_docx("Propuesta Técnica del Oferente",
@@ -384,13 +521,13 @@ async def generar_propuesta(documentos, output_root=OUTPUT_ROOT, on_progress=_no
     # Lista de ítems.
     ruta_items = carpeta / f"Lista_Items_{lic}.docx"
     guardar_docx("Ítems Requeridos por la Licitación",
-                 res["lista_items"], str(ruta_items))
+                 res["lista_items"] or sin_dato, str(ruta_items))
 
     # Matriz de cumplimiento (tablas por sección).
     ruta_matriz = carpeta / f"Matriz_Cumplimiento_{lic}.docx"
     guardar_matriz_docx(
         "Matriz de Cumplimiento",
-        [(d["seccion"], d["matriz"]) for d in res["secciones"]],
+        [(d["seccion"], d["matriz"] or sin_dato) for d in res["secciones"]],
         str(ruta_matriz),
     )
 
