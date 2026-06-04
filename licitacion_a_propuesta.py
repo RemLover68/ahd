@@ -3,16 +3,27 @@
 licitacion_a_propuesta.py
 
 Lógica central que automatiza el flujo de NotebookLM (librería de Teng Lin,
-notebooklm-py) para procesar los documentos de una licitación:
+notebooklm-py) para procesar los documentos de una licitación.
 
-  1. Crea un notebook y sube los documentos (PDFs).
-  2. Envía el primer mensaje: pide la lista completa de ítems/requisitos.
-  3. Espera la respuesta.
-  4. Envía el segundo mensaje: pide redactar la propuesta del oferente.
-  5. Guarda los resultados como .docx con formato bonito dentro de
-     Output/<ID-de-la-licitación>/.
+En vez de pedir toda la propuesta en un único turno (lo que produce respuestas
+poco profundas, porque NotebookLM tiene un tope de longitud por respuesta y
+tiende a resumir), se usa un PIPELINE POR SECCIONES con CHECKPOINTS:
 
-Se usa tanto desde la línea de comandos como desde el backend (server.py).
+  Fase 0  Subir los documentos al notebook.
+  Fase 1  Lista completa de ítems/requisitos de la licitación.
+  Fase 2  Índice de secciones/subsistemas (lo define NotebookLM).
+  Fase 3  Por cada sección: requisitos exhaustivos          -> checkpoint.
+  Fase 4  Por cada sección: propuesta del oferente          -> checkpoint.
+  Fase 5  Por cada sección: matriz de cumplimiento          -> checkpoint.
+  Fase 6  Resumen ejecutivo + ensamblado de los .docx finales.
+
+Cada resultado intermedio se guarda en Output/<ID>/checkpoints/, de modo que un
+fallo no bota todo el trabajo y se pueda auditar/regenerar por partes.
+
+Salidas en Output/<ID-de-la-licitación>/:
+  - Propuesta_Tecnica_<ID>.docx
+  - Lista_Items_<ID>.docx
+  - Matriz_Cumplimiento_<ID>.docx
 
 Uso (CLI):
     python licitacion_a_propuesta.py
@@ -27,6 +38,7 @@ Requisitos:
 import argparse
 import asyncio
 import datetime as _dt
+import inspect
 import re
 import unicodedata
 from pathlib import Path
@@ -34,32 +46,91 @@ from pathlib import Path
 from notebooklm import NotebookLMClient
 
 # --------------------------------------------------------------------------- #
-# Mensajes que se le mandan a NotebookLM (tal cual los pidió el usuario)
+# Prompts
 # --------------------------------------------------------------------------- #
 
-MENSAJE_1 = (
+# Fase 1: lista completa de ítems (igual que la versión original).
+MENSAJE_LISTA = (
     "quiero que me hagas una lista de todos y cada uno de los ítems que pide "
     "la licitación, todo lo requerido por el oferente y las condiciones. que "
-    "esté totalmente completo, revisado, ordenado según el orden requerido de las secciones y que no falte ni se invente ninguno."
+    "esté totalmente completo, revisado, ordenado según el orden requerido de "
+    "las secciones y que no falte ni se invente ninguno."
 )
 
-MENSAJE_2 = (
-    "ok ahora quiero que tomes el output que acabas de darme y escribas una "
-    "propuesta desde el punto de vista del oferente: si pide que se suministre "
-    "x cosa, que se haga una propuesta que diga por ejemplo \"se oferta...\" "
-    "\"se instalarán...\" \"se proveerá...\" y que cuente con cada uno de todos "
-    "los puntos que piden y mantenga el orden requerido."
+# Fase 2: índice de secciones (NotebookLM las define).
+MENSAJE_INDICE = (
+    "A partir de las fuentes, dame únicamente el ÍNDICE de las secciones o "
+    "subsistemas que debe tener la propuesta técnica del oferente. Devuélvelo "
+    "como una lista numerada, una sección por línea, SOLO los títulos, sin "
+    "ninguna descripción, sin detalle y sin sub-puntos."
 )
 
-# Documentos por defecto (los que están en el repositorio). Solo se usan si se
-# invoca el CLI sin argumentos; el backend siempre recibe archivos subidos.
+# Fase 6: resumen ejecutivo.
+MENSAJE_RESUMEN = (
+    "Redacta un breve resumen ejecutivo (máximo 200 palabras) de la propuesta "
+    "técnica del oferente para esta licitación, destacando el alcance general y "
+    "los principales sistemas y equipos ofertados."
+)
+
+
+def _prompt_requisitos(seccion):
+    return (
+        f"Enfócate EXCLUSIVAMENTE en la sección: «{seccion}».\n"
+        "Lista de forma exhaustiva y detallada TODOS los ítems, equipos, "
+        "cantidades, marcas o modelos (si la fuente los indica), normas y "
+        "estándares, valores numéricos, características técnicas y condiciones "
+        "que la licitación exige para esta sección. Un punto por requisito. No "
+        "resumas, no agrupes, no omitas ninguno y no inventes nada. Cita la "
+        "fuente cuando corresponda."
+    )
+
+
+def _prompt_propuesta(seccion, requisitos):
+    return (
+        f"Redacta la propuesta técnica del oferente EXCLUSIVAMENTE para la "
+        f"sección «{seccion}», respondiendo punto por punto a CADA uno de los "
+        "siguientes requisitos. Usa un estilo propositivo: «se proveerá…», «se "
+        "instalará…», «se ofertará…». Mantén todo el nivel de detalle "
+        "(cantidades, modelos, normas, valores) y no omitas ningún punto.\n\n"
+        "--- Requisitos de esta sección ---\n"
+        f"{_truncar(requisitos)}"
+    )
+
+
+def _prompt_matriz(seccion, requisitos):
+    return (
+        f"Para la sección «{seccion}», genera una matriz de cumplimiento en "
+        "formato de tabla Markdown con EXACTAMENTE estas columnas:\n"
+        "| Requisito | Cumplimiento | Referencia |\n"
+        "Una fila por requisito. En 'Cumplimiento' indica cómo lo cumple el "
+        "oferente (empieza con CUMPLE y una breve explicación). En 'Referencia' "
+        "indica la fuente. No omitas requisitos y responde SOLO con la tabla.\n\n"
+        "--- Requisitos de esta sección ---\n"
+        f"{_truncar(requisitos)}"
+    )
+
+
+# Límite de caracteres al re-inyectar requisitos en un prompt (evita que el
+# prompt crezca tanto que NotebookLM devuelva una respuesta vacía).
+_MAX_CTX = 6000
+# Máximo de secciones a procesar (cota de seguridad para no dispararse).
+_MAX_SECCIONES = 20
+
+
+def _truncar(texto, limite=_MAX_CTX):
+    if texto and len(texto) > limite:
+        return texto[:limite] + "\n[...]"
+    return texto
+
+
+# Documentos por defecto (solo para el CLI sin argumentos).
 DOCS_POR_DEFECTO = [
     "Bases_2378-57-L126.pdf",
     "decreto_exento_3892_O_243_obligacion_prs.pdf",
     "decreto_exento_3892_Torniquetes.pdf",
 ]
 
-# Carpeta raíz donde se guardan todos los resultados (una subcarpeta por licitación).
+# Carpeta raíz donde se guardan los resultados (una subcarpeta por licitación).
 OUTPUT_ROOT = "Output"
 
 
@@ -67,8 +138,7 @@ OUTPUT_ROOT = "Output"
 # Identificación de la licitación
 # --------------------------------------------------------------------------- #
 
-# Formatos típicos de ID de licitación de Mercado Público (Chile), p. ej.:
-#   2378-57-L126, 1057823-9-LP24, 750-12-LE23
+# IDs típicos de Mercado Público (Chile), p. ej.: 2378-57-L126, 1057823-9-LP24
 _PATRON_ID_LICITACION = re.compile(r"\b\d{3,8}-\d{1,4}-[A-Z]{1,3}\d{1,4}\b")
 
 
@@ -85,22 +155,15 @@ def _extraer_texto_pdf(ruta, max_paginas=6):
 
 
 def extraer_id_licitacion(documentos):
-    """Busca el ID de la licitación dentro de los PDFs.
-
-    Devuelve el primer ID que calce con el formato de Mercado Público, o None
-    si no encuentra ninguno.
-    """
+    """Busca el ID de la licitación en el nombre o contenido de los PDFs."""
     for ruta in documentos:
         ruta = Path(ruta)
         if ruta.suffix.lower() != ".pdf":
             continue
-        # Primero probamos con el propio nombre del archivo (suele traer el ID).
         m = _PATRON_ID_LICITACION.search(ruta.name)
         if m:
             return m.group(0)
-        # Si no, miramos dentro del contenido.
-        texto = _extraer_texto_pdf(ruta)
-        m = _PATRON_ID_LICITACION.search(texto)
+        m = _PATRON_ID_LICITACION.search(_extraer_texto_pdf(ruta))
         if m:
             return m.group(0)
     return None
@@ -111,16 +174,12 @@ def _sanitizar(nombre):
     nombre = unicodedata.normalize("NFKD", nombre)
     nombre = nombre.encode("ascii", "ignore").decode("ascii")
     nombre = re.sub(r"[^\w\s.-]", "", nombre).strip()
-    nombre = re.sub(r"[\s]+", "_", nombre)
+    nombre = re.sub(r"\s+", "_", nombre)
     return nombre or "licitacion"
 
 
 def nombre_licitacion(documentos):
-    """Determina el nombre identificador de la licitación.
-
-    Usa el ID encontrado en los PDFs; si no encuentra ninguno, usa el nombre
-    (sin extensión) del primer documento.
-    """
+    """ID de la licitación (de los PDFs) o, si no se encuentra, nombre del 1er archivo."""
     lic_id = extraer_id_licitacion(documentos)
     if lic_id:
         return _sanitizar(lic_id)
@@ -130,102 +189,47 @@ def nombre_licitacion(documentos):
 
 
 # --------------------------------------------------------------------------- #
-# Flujo principal contra NotebookLM
+# Utilidades de NotebookLM
 # --------------------------------------------------------------------------- #
 
 def _noop(progreso, mensaje):  # callback de progreso por defecto
     pass
 
 
-async def procesar(documentos, nombre_notebook, on_progress=_noop):
-    """Sube los documentos, manda los dos mensajes y devuelve (lista_items, propuesta)."""
-    # Según la versión de notebooklm-py, from_storage() puede ser síncrono (devuelve
-    # el cliente/context manager directo) o asíncrono (devuelve una corrutina que hay
-    # que await-ear). Soportamos ambos casos.
-    import inspect
-
-    cliente_cm = NotebookLMClient.from_storage()
-    if inspect.iscoroutine(cliente_cm):
-        cliente_cm = await cliente_cm
-
-    async with cliente_cm as client:
-        # 1. Crear el notebook
-        on_progress(5, "Creando notebook")
-        print(f"→ Creando notebook: {nombre_notebook!r}")
-        nb = await client.notebooks.create(nombre_notebook)
-        print(f"  notebook id: {nb.id}")
-
-        # 2. Subir cada documento y esperar a que NotebookLM lo procese
-        total = max(len(documentos), 1)
-        for i, ruta in enumerate(documentos):
-            ruta = Path(ruta)
-            if not ruta.exists():
-                raise FileNotFoundError(f"No se encontró el documento: {ruta}")
-            on_progress(10 + int(40 * i / total), f"Subiendo {ruta.name}")
-            print(f"→ Subiendo documento: {ruta.name}")
-            source = await client.sources.add_file(nb.id, ruta)
-            await client.sources.wait_until_ready(nb.id, source.id)
-            print(f"  listo: {ruta.name}")
-
-        # 3. Primer mensaje: lista de ítems requeridos
-        on_progress(55, "Extrayendo requerimientos de la licitación")
-        print("→ Enviando primer mensaje (lista de ítems de la licitación)...")
-        r1 = await _ask_con_reintentos(client, nb.id, MENSAJE_1)
-        print("  respuesta 1 recibida.")
-
-        # 4. Segundo mensaje: redactar la propuesta del oferente.
-        #    El chat de NotebookLM mantiene el contexto de la conversación dentro
-        #    del mismo notebook, así que basta con mandar el mensaje tal cual
-        #    ("el output que acabas de darme"). NO reenviamos la respuesta
-        #    anterior: hacerlo genera un prompt enorme que NotebookLM responde
-        #    vacío (ChatResponseParseError).
-        on_progress(78, "Redactando la propuesta del oferente")
-        print("→ Enviando segundo mensaje (redacción de la propuesta)...")
-        r2 = await _ask_con_reintentos(client, nb.id, MENSAJE_2)
-        print("  respuesta 2 recibida.")
-
-        return r1.answer, r2.answer
+async def _abrir_cliente():
+    """Abre el cliente soportando from_storage() síncrono o asíncrono según versión."""
+    cm = NotebookLMClient.from_storage()
+    if inspect.iscoroutine(cm):
+        cm = await cm
+    return cm
 
 
 def _excepciones_de_parseo():
-    """Devuelve la(s) excepción(es) de respuesta vacía/no parseable de notebooklm.
-
-    El nombre y la ubicación de esta excepción cambian entre versiones de
-    notebooklm-py, así que la buscamos de forma flexible y, si no existe,
-    caemos a la excepción base de la librería.
-    """
+    """Excepción(es) de respuesta vacía/no parseable de notebooklm (varía por versión)."""
     try:
         import notebooklm.exceptions as exc
     except Exception:
         return (Exception,)
 
-    candidatos = [
-        "ChatResponseParseError", "ResponseParseError",
-        "ChatParseError", "ParseError",
-    ]
+    candidatos = ["ChatResponseParseError", "ResponseParseError",
+                  "ChatParseError", "ParseError"]
     encontradas = tuple(
-        getattr(exc, n) for n in candidatos if isinstance(getattr(exc, n, None), type)
+        getattr(exc, n) for n in candidatos
+        if isinstance(getattr(exc, n, None), type)
     )
     if encontradas:
         return encontradas
-
-    # Fallback: la excepción base de la librería (reintentamos ante cualquier
-    # fallo de la API, que suele ser transitorio).
     base = getattr(exc, "NotebookLMError", None)
     return (base,) if isinstance(base, type) else (Exception,)
 
 
-async def _ask_con_reintentos(client, nb_id, mensaje, intentos=4):
-    """Envía un mensaje al chat reintentando ante respuestas vacías/no parseables.
-
-    El error de parseo suele ser intermitente (la API devuelve un stream vacío).
-    Reintentamos con backoff exponencial antes de fallar.
-    """
+async def _ask(client, nb_id, mensaje, intentos=4):
+    """Envía un mensaje al chat reintentando ante respuestas vacías/no parseables."""
     errores = _excepciones_de_parseo()
-
     for intento in range(1, intentos + 1):
         try:
-            return await client.chat.ask(nb_id, mensaje)
+            r = await client.chat.ask(nb_id, mensaje)
+            return r.answer
         except errores:
             if intento == intentos:
                 raise
@@ -233,6 +237,112 @@ async def _ask_con_reintentos(client, nb_id, mensaje, intentos=4):
             print(f"  respuesta vacía, reintentando en {espera}s "
                   f"(intento {intento}/{intentos - 1})...")
             await asyncio.sleep(espera)
+
+
+def _parsear_indice(texto):
+    """Extrae los títulos de sección de la respuesta de índice de NotebookLM."""
+    secciones = []
+    for linea in texto.splitlines():
+        l = linea.strip()
+        if not l:
+            continue
+        # "1. Título", "1) Título", "- Título", "* Título", "## Título"
+        m = re.match(r"^\s*(?:\d+[.)]|[-*•]|#+)\s+(.*)$", l)
+        titulo = (m.group(1) if m else l).strip()
+        titulo = titulo.strip("*").strip()
+        # Descartamos líneas que claramente no son títulos.
+        if len(titulo) < 3 or len(titulo) > 160:
+            continue
+        if titulo.lower().startswith(("a continuación", "estas son", "el índice",
+                                      "aquí", "la propuesta")):
+            continue
+        secciones.append(titulo)
+        if len(secciones) >= _MAX_SECCIONES:
+            break
+    return secciones
+
+
+# --------------------------------------------------------------------------- #
+# Pipeline contra NotebookLM
+# --------------------------------------------------------------------------- #
+
+async def _ejecutar_pipeline(documentos, nombre_notebook, carpeta, on_progress):
+    """Corre el pipeline completo en un único notebook y devuelve los textos."""
+    ckpt = Path(carpeta) / "checkpoints"
+    (ckpt / "01_requisitos").mkdir(parents=True, exist_ok=True)
+    (ckpt / "02_propuesta").mkdir(parents=True, exist_ok=True)
+    (ckpt / "03_matriz").mkdir(parents=True, exist_ok=True)
+
+    cliente_cm = await _abrir_cliente()
+    async with cliente_cm as client:
+        # Fase 0: notebook + subida de documentos.
+        on_progress(5, "Creando notebook")
+        nb = await client.notebooks.create(nombre_notebook)
+        print(f"  notebook id: {nb.id}")
+
+        total_docs = max(len(documentos), 1)
+        for i, ruta in enumerate(documentos):
+            ruta = Path(ruta)
+            if not ruta.exists():
+                raise FileNotFoundError(f"No se encontró el documento: {ruta}")
+            on_progress(8 + int(22 * i / total_docs), f"Subiendo {ruta.name}")
+            print(f"→ Subiendo documento: {ruta.name}")
+            source = await client.sources.add_file(nb.id, ruta)
+            await client.sources.wait_until_ready(nb.id, source.id)
+
+        # Fase 1: lista completa de ítems.
+        on_progress(32, "Extrayendo la lista de ítems de la licitación")
+        lista_items = await _ask(client, nb.id, MENSAJE_LISTA)
+        (ckpt / "00_lista_items.md").write_text(lista_items, encoding="utf-8")
+
+        # Fase 2: índice de secciones.
+        on_progress(38, "Determinando las secciones de la propuesta")
+        indice_raw = await _ask(client, nb.id, MENSAJE_INDICE)
+        (ckpt / "00_indice_secciones.md").write_text(indice_raw, encoding="utf-8")
+        secciones = _parsear_indice(indice_raw)
+        if not secciones:
+            secciones = ["Propuesta técnica general"]
+        print(f"  secciones detectadas: {len(secciones)}")
+
+        # Fases 3-5: por cada sección, requisitos + propuesta + matriz.
+        datos = []
+        n = len(secciones)
+        # Repartimos el progreso 40..90 entre las secciones.
+        for idx, seccion in enumerate(secciones):
+            base = 40 + int(50 * idx / n)
+            slug = f"{idx + 1:02d}_{_sanitizar(seccion)[:40]}"
+
+            on_progress(base, f"Requisitos: {seccion}")
+            print(f"→ [{idx+1}/{n}] Requisitos: {seccion}")
+            requisitos = await _ask(client, nb.id, _prompt_requisitos(seccion))
+            (ckpt / "01_requisitos" / f"{slug}.md").write_text(
+                f"# {seccion}\n\n{requisitos}", encoding="utf-8")
+
+            on_progress(base + 3, f"Propuesta: {seccion}")
+            print(f"→ [{idx+1}/{n}] Propuesta: {seccion}")
+            propuesta = await _ask(client, nb.id, _prompt_propuesta(seccion, requisitos))
+            (ckpt / "02_propuesta" / f"{slug}.md").write_text(
+                f"# {seccion}\n\n{propuesta}", encoding="utf-8")
+
+            on_progress(base + 6, f"Matriz: {seccion}")
+            print(f"→ [{idx+1}/{n}] Matriz: {seccion}")
+            matriz = await _ask(client, nb.id, _prompt_matriz(seccion, requisitos))
+            (ckpt / "03_matriz" / f"{slug}.md").write_text(
+                f"# {seccion}\n\n{matriz}", encoding="utf-8")
+
+            datos.append({
+                "seccion": seccion,
+                "requisitos": requisitos,
+                "propuesta": propuesta,
+                "matriz": matriz,
+            })
+
+        # Fase 6: resumen ejecutivo.
+        on_progress(92, "Redactando el resumen ejecutivo")
+        resumen = await _ask(client, nb.id, MENSAJE_RESUMEN)
+        (ckpt / "04_resumen.md").write_text(resumen, encoding="utf-8")
+
+        return {"lista_items": lista_items, "resumen": resumen, "secciones": datos}
 
 
 # --------------------------------------------------------------------------- #
@@ -244,7 +354,7 @@ async def generar_propuesta(documentos, output_root=OUTPUT_ROOT, on_progress=_no
     """Procesa la licitación de punta a punta y guarda los .docx.
 
     Devuelve un dict con el id de la licitación, la carpeta de salida y la lista
-    de archivos generados (cada uno con id, título, descripción y ruta).
+    de archivos generados.
     """
     documentos = [Path(d) for d in documentos]
 
@@ -256,16 +366,33 @@ async def generar_propuesta(documentos, output_root=OUTPUT_ROOT, on_progress=_no
     carpeta = Path(output_root) / lic
     carpeta.mkdir(parents=True, exist_ok=True)
 
-    lista_items, propuesta = await procesar(documentos, nombre_notebook, on_progress)
+    res = await _ejecutar_pipeline(documentos, nombre_notebook, carpeta, on_progress)
 
-    on_progress(92, "Generando documentos .docx")
+    on_progress(95, "Generando documentos .docx")
     fecha = _dt.date.today().strftime("%d/%m/%Y")
 
+    # Propuesta técnica: resumen ejecutivo + propuesta de cada sección.
+    cuerpo_propuesta = ["## Resumen ejecutivo", res["resumen"], ""]
+    for d in res["secciones"]:
+        cuerpo_propuesta.append(f"## {d['seccion']}")
+        cuerpo_propuesta.append(d["propuesta"])
+        cuerpo_propuesta.append("")
     ruta_propuesta = carpeta / f"Propuesta_Tecnica_{lic}.docx"
-    guardar_docx("Propuesta Técnica del Oferente", propuesta, str(ruta_propuesta))
+    guardar_docx("Propuesta Técnica del Oferente",
+                 "\n".join(cuerpo_propuesta), str(ruta_propuesta))
 
+    # Lista de ítems.
     ruta_items = carpeta / f"Lista_Items_{lic}.docx"
-    guardar_docx("Ítems Requeridos por la Licitación", lista_items, str(ruta_items))
+    guardar_docx("Ítems Requeridos por la Licitación",
+                 res["lista_items"], str(ruta_items))
+
+    # Matriz de cumplimiento (tablas por sección).
+    ruta_matriz = carpeta / f"Matriz_Cumplimiento_{lic}.docx"
+    guardar_matriz_docx(
+        "Matriz de Cumplimiento",
+        [(d["seccion"], d["matriz"]) for d in res["secciones"]],
+        str(ruta_matriz),
+    )
 
     on_progress(100, "Proceso finalizado")
 
@@ -273,44 +400,34 @@ async def generar_propuesta(documentos, output_root=OUTPUT_ROOT, on_progress=_no
         "licitacion": lic,
         "carpeta": str(carpeta),
         "archivos": [
-            {
-                "id": "propuesta",
-                "title": "Propuesta técnica",
-                "description": "Propuesta técnica del oferente, punto por punto.",
-                "filename": ruta_propuesta.name,
-                "path": str(ruta_propuesta),
-                "date": fecha,
-            },
-            {
-                "id": "items",
-                "title": "Lista de ítems",
-                "description": "Ítems y condiciones requeridos por la licitación.",
-                "filename": ruta_items.name,
-                "path": str(ruta_items),
-                "date": fecha,
-            },
+            {"id": "propuesta", "title": "Propuesta técnica",
+             "description": "Propuesta del oferente, sección por sección y punto por punto.",
+             "filename": ruta_propuesta.name, "path": str(ruta_propuesta), "date": fecha},
+            {"id": "items", "title": "Lista de ítems",
+             "description": "Ítems y condiciones requeridos por la licitación.",
+             "filename": ruta_items.name, "path": str(ruta_items), "date": fecha},
+            {"id": "matriz", "title": "Matriz de cumplimiento",
+             "description": "Requisito → cumplimiento → referencia, por sección.",
+             "filename": ruta_matriz.name, "path": str(ruta_matriz), "date": fecha},
         ],
     }
 
 
 # --------------------------------------------------------------------------- #
-# Generación del .docx con formato bonito
+# Generación de .docx con formato bonito
 # --------------------------------------------------------------------------- #
 
-def guardar_docx(titulo, contenido, ruta_salida):
-    """Convierte el texto (markdown sencillo) en un .docx con formato."""
+def _nuevo_doc(titulo):
+    """Crea un documento con estilo base y portada."""
     from docx import Document
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.shared import Pt, RGBColor
 
     doc = Document()
-
-    # --- Estilo base del documento ---
     base = doc.styles["Normal"]
     base.font.name = "Calibri"
     base.font.size = Pt(11)
 
-    # --- Portada / título ---
     t = doc.add_paragraph()
     t.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = t.add_run(titulo)
@@ -327,46 +444,91 @@ def guardar_docx(titulo, contenido, ruta_salida):
     srun.font.color.rgb = RGBColor(0x70, 0x70, 0x70)
 
     doc.add_paragraph()  # espacio
+    return doc
 
-    # --- Cuerpo: parseo de markdown sencillo ---
+
+def guardar_docx(titulo, contenido, ruta_salida):
+    """Convierte texto (markdown sencillo) en un .docx con formato."""
+    doc = _nuevo_doc(titulo)
     for linea in contenido.splitlines():
         _agregar_linea(doc, linea)
-
     doc.save(ruta_salida)
     print(f"→ Documento guardado en: {ruta_salida}")
 
 
+def guardar_matriz_docx(titulo, secciones_tablas, ruta_salida):
+    """Genera un .docx con una tabla de cumplimiento por sección."""
+    doc = _nuevo_doc(titulo)
+    for seccion, tabla_md in secciones_tablas:
+        doc.add_heading(seccion, level=2)
+        filas = _parsear_tabla_md(tabla_md)
+        if filas:
+            _agregar_tabla(doc, filas)
+        else:
+            # Si no vino como tabla, lo volcamos como texto para no perderlo.
+            for linea in tabla_md.splitlines():
+                _agregar_linea(doc, linea)
+        doc.add_paragraph()
+    doc.save(ruta_salida)
+    print(f"→ Documento guardado en: {ruta_salida}")
+
+
+def _parsear_tabla_md(texto):
+    """Extrae las filas de una tabla Markdown (lista de listas de celdas)."""
+    filas = []
+    for linea in texto.splitlines():
+        l = linea.strip()
+        if not l.startswith("|"):
+            continue
+        celdas = [c.strip() for c in l.strip("|").split("|")]
+        # Saltar la fila separadora (---|---).
+        if celdas and all(set(c) <= set("-: ") and c != "" for c in celdas):
+            continue
+        filas.append(celdas)
+    return filas
+
+
+def _agregar_tabla(doc, filas):
+    """Agrega una tabla al documento (primera fila como encabezado en negrita)."""
+    ncols = max(len(f) for f in filas)
+    tabla = doc.add_table(rows=0, cols=ncols)
+    tabla.style = "Table Grid"
+    for i, fila in enumerate(filas):
+        celdas = tabla.add_row().cells
+        for j in range(ncols):
+            valor = fila[j].replace("**", "") if j < len(fila) else ""
+            celda = celdas[j]
+            celda.text = ""
+            run = celda.paragraphs[0].add_run(valor)
+            if i == 0:
+                run.bold = True
+
+
 def _agregar_linea(doc, linea):
     """Interpreta una línea de markdown sencillo y la agrega al documento."""
-    from docx.shared import Pt
-
     texto = linea.rstrip()
     if not texto.strip():
         return
 
     stripped = texto.lstrip()
 
-    # Encabezados markdown: #, ##, ###
     if stripped.startswith("#"):
         nivel = len(stripped) - len(stripped.lstrip("#"))
         titulo = stripped[nivel:].strip()
         doc.add_heading(titulo, level=min(nivel, 4))
         return
 
-    # Viñetas: -, *, •
     if stripped[:2] in ("- ", "* ") or stripped.startswith("• "):
         p = doc.add_paragraph(style="List Bullet")
         _runs_con_negrita(p, stripped[2:].strip())
         return
 
-    # Listas numeradas: "1. ", "2) ", etc.
     if _es_lista_numerada(stripped):
         contenido = stripped.split(None, 1)[1] if " " in stripped else stripped
         p = doc.add_paragraph(style="List Number")
         _runs_con_negrita(p, contenido)
         return
 
-    # Párrafo normal
     p = doc.add_paragraph()
     _runs_con_negrita(p, stripped)
 
@@ -383,7 +545,6 @@ def _runs_con_negrita(parrafo, texto):
         if not parte:
             continue
         run = parrafo.add_run(parte)
-        # Las posiciones impares estaban entre ** ** → negrita
         if i % 2 == 1:
             run.bold = True
 
@@ -394,23 +555,19 @@ def _runs_con_negrita(parrafo, texto):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Procesa una licitación en NotebookLM y genera la propuesta en .docx"
+        description="Procesa una licitación en NotebookLM y genera los .docx"
     )
-    parser.add_argument(
-        "documentos",
-        nargs="*",
-        default=DOCS_POR_DEFECTO,
-        help="Documentos a subir (por defecto: los PDFs de la licitación en el repo).",
-    )
-    parser.add_argument(
-        "--output",
-        default=OUTPUT_ROOT,
-        help=f"Carpeta raíz de salida (por defecto: {OUTPUT_ROOT}).",
-    )
+    parser.add_argument("documentos", nargs="*", default=DOCS_POR_DEFECTO,
+                        help="Documentos a subir (por defecto: los PDFs del repo).")
+    parser.add_argument("--output", default=OUTPUT_ROOT,
+                        help=f"Carpeta raíz de salida (por defecto: {OUTPUT_ROOT}).")
     args = parser.parse_args()
 
+    def progreso(p, m):
+        print(f"  [{p:3d}%] {m}")
+
     resultado = asyncio.run(
-        generar_propuesta(args.documentos, output_root=args.output)
+        generar_propuesta(args.documentos, output_root=args.output, on_progress=progreso)
     )
 
     print(f"\n✓ Licitación: {resultado['licitacion']}")

@@ -8,13 +8,18 @@ oferente en formato `.docx`, con un frontend web para manejarlo cómodamente.
 
 1. Subes los documentos de la licitación desde la web (o por CLI).
 2. Crea un notebook en NotebookLM y sube los documentos.
-3. Manda el primer mensaje pidiendo **la lista completa de ítems / requisitos**.
-4. Manda el segundo mensaje pidiendo **redactar la propuesta del oferente**
-   ("se oferta...", "se instalarán...", "se proveerá...").
-5. Guarda los resultados como `.docx` con formato bonito en
-   **`Output/<ID-de-la-licitación>/`**:
+3. Ejecuta un **pipeline por secciones con checkpoints** (en vez de pedir todo
+   en un solo turno, que da respuestas poco profundas):
+   - **Fase 1:** lista completa de ítems / requisitos.
+   - **Fase 2:** índice de secciones (lo define NotebookLM).
+   - **Fase 3–5:** por cada sección → requisitos exhaustivos, propuesta del
+     oferente y matriz de cumplimiento (cada uno guardado como checkpoint).
+   - **Fase 6:** resumen ejecutivo y ensamblado de los `.docx`.
+4. Guarda los resultados en **`Output/<ID-de-la-licitación>/`**:
    - `Propuesta_Tecnica_<ID>.docx`
    - `Lista_Items_<ID>.docx`
+   - `Matriz_Cumplimiento_<ID>.docx`
+   - `checkpoints/` con todos los intermedios (auditables / regenerables).
 
 El **nombre de la subcarpeta** es el ID de la licitación detectado en los PDFs
 (formato Mercado Público, p. ej. `2378-57-L126`). Si no se encuentra ninguno,
