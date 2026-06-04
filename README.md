@@ -34,7 +34,10 @@ usa el nombre del primer archivo subido.
 ## Requisitos previos (una sola vez)
 
 ```bash
-# Backend
+# Backend (dentro de un entorno virtual .venv)
+python -m venv .venv
+# Windows:        .\.venv\Scripts\activate
+# Linux/macOS:    source .venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium
 notebooklm login        # inicia sesión con Google
@@ -46,11 +49,17 @@ pnpm install            # o npm install
 
 ## Uso con la web (frontend + backend)
 
-En una terminal, levanta el backend:
+En una terminal, **con el `.venv` activado** y desde la raíz del repo, levanta
+el backend (no requiere Docker):
 
 ```bash
+# Windows:        .\.venv\Scripts\activate
+# Linux/macOS:    source .venv/bin/activate
 uvicorn server:app --reload --port 8000
 ```
+
+> Importante: activa el `.venv` antes de `uvicorn`, si no usará un Python sin
+> las dependencias. El backend escribe sus logs en consola y en `backend.log`.
 
 En otra, levanta el frontend:
 
