@@ -8,6 +8,8 @@ export interface FileItem {
   type: string;
   size: number;
   status: FileStatus;
+  // Archivo real seleccionado por el usuario, necesario para subirlo al backend.
+  file?: File;
 }
 
 interface FileListProps {

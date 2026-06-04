@@ -1,39 +1,20 @@
 import { X, FileText, Download } from 'lucide-react';
 
-interface DownloadModalProps {
-  isOpen: boolean;
-  onClose: () => void;
-  onDownload: (format: string) => void;
+interface DownloadFile {
+  id: string;
+  title: string;
+  description: string;
+  filename: string;
 }
 
-const downloadOptions = [
-  {
-    id: 'word',
-    title: 'Propuesta técnica',
-    format: 'Word (.docx)',
-    description: 'Documento completo con propuesta técnica propositiva',
-  },
-  {
-    id: 'excel',
-    title: 'Matriz de cumplimiento',
-    format: 'Excel (.xlsx)',
-    description: 'Tabla detallada de cumplimiento técnico y legal',
-  },
-  {
-    id: 'pdf',
-    title: 'Resumen ejecutivo',
-    format: 'PDF',
-    description: 'Resumen consolidado para revisión comercial',
-  },
-  {
-    id: 'zip',
-    title: 'Paquete completo',
-    format: 'ZIP',
-    description: 'Todos los entregables en formato corporativo SONDA',
-  },
-];
+interface DownloadModalProps {
+  isOpen: boolean;
+  files: DownloadFile[];
+  onClose: () => void;
+  onDownload: (id: string) => void;
+}
 
-export function DownloadModal({ isOpen, onClose, onDownload }: DownloadModalProps) {
+export function DownloadModal({ isOpen, files, onClose, onDownload }: DownloadModalProps) {
   if (!isOpen) return null;
 
   return (
@@ -53,11 +34,11 @@ export function DownloadModal({ isOpen, onClose, onDownload }: DownloadModalProp
 
         <div className="p-6">
           <p className="text-sm text-[#666666] mb-6">
-            Selecciona el formato que deseas descargar. Todos los archivos están en formato corporativo SONDA.
+            Selecciona el documento que deseas descargar (formato Word .docx).
           </p>
 
           <div className="space-y-4">
-            {downloadOptions.map((option) => (
+            {files.map((option) => (
               <button
                 key={option.id}
                 onClick={() => onDownload(option.id)}
@@ -73,7 +54,7 @@ export function DownloadModal({ isOpen, onClose, onDownload }: DownloadModalProp
                         {option.title}
                       </h4>
                       <span className="text-xs text-[#666666] bg-[#E4E4E4] px-2 py-1 rounded">
-                        {option.format}
+                        {option.filename.split('.').pop()?.toUpperCase()}
                       </span>
                     </div>
                     <p className="text-sm text-[#666666]">{option.description}</p>
@@ -85,17 +66,11 @@ export function DownloadModal({ isOpen, onClose, onDownload }: DownloadModalProp
 
           <div className="mt-6 pt-6 border-t border-[#E4E4E4] flex gap-4">
             <button
-              onClick={() => onDownload('zip')}
-              className="flex-1 px-6 py-3 bg-[#205DF5] text-white rounded-lg hover:bg-opacity-90 transition-colors flex items-center justify-center gap-2"
+              onClick={onClose}
+              className="ml-auto px-6 py-3 border border-[#E4E4E4] text-[#3D3D3D] rounded-lg hover:bg-[#E4E4E4] hover:bg-opacity-30 transition-colors flex items-center justify-center gap-2"
             >
               <Download className="w-5 h-5" />
-              Descargar paquete completo
-            </button>
-            <button
-              onClick={onClose}
-              className="px-6 py-3 border border-[#E4E4E4] text-[#3D3D3D] rounded-lg hover:bg-[#E4E4E4] hover:bg-opacity-30 transition-colors"
-            >
-              Cancelar
+              Cerrar
             </button>
           </div>
         </div>

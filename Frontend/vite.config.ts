@@ -33,4 +33,11 @@ export default defineConfig({
 
   // File types to support raw imports. Never add .css, .tsx, or .ts files to this.
   assetsInclude: ['**/*.svg', '**/*.csv'],
+
+  // Durante el desarrollo, reenviamos las llamadas /api al backend (FastAPI).
+  server: {
+    proxy: {
+      '/api': 'http://localhost:8000',
+    },
+  },
 })

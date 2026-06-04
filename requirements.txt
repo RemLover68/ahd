@@ -1,2 +1,6 @@
 notebooklm-py[browser]
 python-docx
+pypdf
+fastapi
+uvicorn[standard]
+python-multipart

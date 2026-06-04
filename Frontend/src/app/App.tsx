@@ -14,7 +14,7 @@ import { DownloadModal } from "./components/DownloadModal";
 import { Footer } from "./components/Footer";
 import { Toaster } from "./components/ui/sonner";
 import { toast } from "sonner";
-import { CheckCircle2, XCircle } from "lucide-react";
+import { CheckCircle2 } from "lucide-react";
 
 type ProcessingPhase =
   | "idle"
@@ -22,73 +22,30 @@ type ProcessingPhase =
   | "completed"
   | "error";
 
-const mockFiles = [
-  {
-    name: "Bases técnicas transporte inteligente.pdf",
-    type: "PDF",
-    sizeMB: 2.4,
-  },
-  {
-    name: "Anexo sistema de cámaras.docx",
-    type: "DOCX",
-    sizeMB: 0.8,
-  },
-  {
-    name: "Preguntas y respuestas cliente.xlsx",
-    type: "XLSX",
-    sizeMB: 0.3,
-  },
-];
+interface ResultItem {
+  id: string;
+  title: string;
+  description: string;
+  filename: string;
+  date: string;
+  status: "ready";
+}
 
-const processingSteps = [
-  { label: "Leyendo documentos", progress: 20 },
-  { label: "Extrayendo requerimientos", progress: 40 },
-  { label: "Consolidando información", progress: 60 },
-  { label: "Generando entregables", progress: 80 },
-  { label: "Proceso finalizado", progress: 100 },
-];
+// Espera entre cada consulta de estado al backend (polling).
+const POLL_MS = 1500;
 
-const mockResults = [
-  {
-    id: "propuesta",
-    title: "Propuesta técnica",
-    description:
-      "Propuesta técnica propositiva para SmartCities & Mobility",
-    date: "04/06/2026",
-    status: "ready" as const,
-  },
-  {
-    id: "matriz",
-    title: "Matriz de cumplimiento",
-    description:
-      "Tabla de cumplimiento técnico y legal detallada",
-    date: "04/06/2026",
-    status: "ready" as const,
-  },
-  {
-    id: "cotizacion",
-    title: "Solicitud de cotización",
-    description:
-      "Lista de equipos y materiales para cotización",
-    date: "04/06/2026",
-    status: "ready" as const,
-  },
-  {
-    id: "resumen",
-    title: "Resumen ejecutivo",
-    description: "Resumen consolidado para revisión comercial",
-    date: "04/06/2026",
-    status: "ready" as const,
-  },
-  {
-    id: "cambios",
-    title: "Registro de cambios",
-    description:
-      "Cambios detectados en aclaraciones y circulares",
-    date: "04/06/2026",
-    status: "ready" as const,
-  },
-];
+const sleep = (ms: number) =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+// Dispara la descarga de un .docx generado por el backend.
+function descargar(jobId: string, resultId: string) {
+  const a = document.createElement("a");
+  a.href = `/api/download/${jobId}/${resultId}`;
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
 
 export default function App() {
   const [files, setFiles] = useState<FileItem[]>([]);
@@ -97,12 +54,14 @@ export default function App() {
   >(["propuesta", "equipos", "matriz"]);
   const [processingPhase, setProcessingPhase] =
     useState<ProcessingPhase>("idle");
-  const [currentStep, setCurrentStep] = useState(0);
+  const [progress, setProgress] = useState(0);
+  const [statusMessage, setStatusMessage] = useState(
+    "Preparando",
+  );
   const [showDownloadModal, setShowDownloadModal] =
     useState(false);
-  const [results, setResults] = useState<typeof mockResults>(
-    [],
-  );
+  const [results, setResults] = useState<ResultItem[]>([]);
+  const [jobId, setJobId] = useState<string | null>(null);
 
   const handleFilesSelected = (newFiles: File[]) => {
     const fileItems: FileItem[] = newFiles.map(
@@ -113,6 +72,7 @@ export default function App() {
           file.name.split(".").pop()?.toUpperCase() || "FILE",
         size: file.size,
         status: "pending" as FileStatus,
+        file,
       }),
     );
 
@@ -126,6 +86,9 @@ export default function App() {
     setFiles((prev) => prev.filter((f) => f.id !== id));
   };
 
+  const setAllStatus = (status: FileStatus) =>
+    setFiles((prev) => prev.map((f) => ({ ...f, status })));
+
   const handleProcess = async () => {
     if (files.length === 0) {
       toast.error("No hay archivos para procesar", {
@@ -136,97 +99,99 @@ export default function App() {
     }
 
     setProcessingPhase("processing");
-    setFiles((prev) =>
-      prev.map((f) => ({
-        ...f,
-        status: "uploading" as FileStatus,
-      })),
-    );
+    setProgress(0);
+    setStatusMessage("Subiendo documentos");
+    setAllStatus("uploading");
 
-    for (let i = 0; i < processingSteps.length; i++) {
-      setCurrentStep(i);
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+    try {
+      // 1. Subir los archivos y arrancar el trabajo en el backend.
+      const formData = new FormData();
+      files.forEach((f) => {
+        if (f.file) formData.append("files", f.file, f.name);
+      });
 
-      if (i === 1) {
-        setFiles((prev) =>
-          prev.map((f) => ({
-            ...f,
-            status: "processing" as FileStatus,
-          })),
-        );
+      const res = await fetch("/api/process", {
+        method: "POST",
+        body: formData,
+      });
+      if (!res.ok) {
+        throw new Error(`El backend respondió ${res.status}`);
       }
+      const { job_id } = await res.json();
+      setJobId(job_id);
+      setAllStatus("processing");
+
+      // 2. Polling del estado hasta que termine o falle.
+      while (true) {
+        await sleep(POLL_MS);
+        const sres = await fetch(`/api/status/${job_id}`);
+        if (!sres.ok) {
+          throw new Error(`Estado no disponible (${sres.status})`);
+        }
+        const estado = await sres.json();
+        setProgress(estado.progress ?? 0);
+        setStatusMessage(estado.message ?? "Procesando");
+
+        if (estado.phase === "completed") {
+          const items: ResultItem[] = (estado.results ?? []).map(
+            (r: Omit<ResultItem, "status">) => ({
+              ...r,
+              status: "ready" as const,
+            }),
+          );
+          setResults(items);
+          setAllStatus("ready");
+          setProcessingPhase("completed");
+          toast.success("Documentos procesados correctamente", {
+            description: `Licitación ${estado.licitacion}: entregables listos para descargar`,
+            icon: (
+              <CheckCircle2 className="w-5 h-5 text-green-600" />
+            ),
+          });
+          break;
+        }
+
+        if (estado.phase === "error") {
+          throw new Error(estado.error ?? "Error desconocido");
+        }
+      }
+    } catch (err) {
+      setProcessingPhase("error");
+      setAllStatus("error");
+      toast.error("No se pudo completar el procesamiento", {
+        description:
+          err instanceof Error ? err.message : String(err),
+      });
     }
-
-    setFiles((prev) =>
-      prev.map((f) => ({
-        ...f,
-        status: "ready" as FileStatus,
-      })),
-    );
-    setProcessingPhase("completed");
-    setResults(mockResults);
-
-    toast.success("Documentos procesados correctamente", {
-      description:
-        "Los entregables están listos para descargar",
-      icon: <CheckCircle2 className="w-5 h-5 text-green-600" />,
-    });
   };
 
   const handleClear = () => {
     setFiles([]);
     setSelectedOptions([]);
     setProcessingPhase("idle");
-    setCurrentStep(0);
+    setProgress(0);
     setResults([]);
+    setJobId(null);
     toast.info("Selección limpiada");
   };
 
   const handleViewDetail = (id: string) => {
-    const result = results.find((r) => r.id === id);
-    toast.info(`Ver detalle: ${result?.title}`, {
-      description:
-        "Esta función abrirá el documento en vista previa",
-    });
+    // Sin vista previa por ahora: descargamos el documento.
+    handleDownloadSingle(id);
   };
 
   const handleDownloadSingle = (id: string) => {
+    if (!jobId) return;
     const result = results.find((r) => r.id === id);
-    toast.success(`Descargando: ${result?.title}`, {
-      description: "El archivo se descargará en breve",
+    descargar(jobId, id);
+    toast.success(`Descargando: ${result?.title ?? id}`, {
+      description: result?.filename,
     });
   };
 
-  const handleDownloadFromModal = (format: string) => {
-    const formatNames: Record<string, string> = {
-      word: "Propuesta técnica (Word)",
-      excel: "Matriz de cumplimiento (Excel)",
-      pdf: "Resumen ejecutivo (PDF)",
-      zip: "Paquete completo (ZIP)",
-    };
-
-    toast.success(`Descargando: ${formatNames[format]}`, {
-      description: "El archivo se descargará en breve",
-    });
+  const handleDownloadFromModal = (id: string) => {
+    handleDownloadSingle(id);
     setShowDownloadModal(false);
-  };
-
-  const handleUseMockFiles = () => {
-    const fileItems: FileItem[] = mockFiles.map(
-      (file, index) => ({
-        id: `mock-${Date.now()}-${index}`,
-        name: file.name,
-        type: file.type,
-        size: file.sizeMB * 1024 * 1024,
-        status: "pending" as FileStatus,
-      }),
-    );
-
-    setFiles(fileItems);
-    toast.success("Archivos de ejemplo cargados", {
-      description:
-        "Puedes proceder a configurar y procesar los documentos",
-    });
   };
 
   return (
@@ -236,17 +201,6 @@ export default function App() {
         <Header />
 
         <Hero />
-
-        {files.length === 0 && processingPhase === "idle" && (
-          <div className="w-full max-w-7xl mx-auto px-8 pb-4">
-            <button
-              onClick={handleUseMockFiles}
-              className="text-sm text-[#205DF5] hover:underline"
-            >
-              O haz clic aquí para cargar archivos de ejemplo
-            </button>
-          </div>
-        )}
 
         <FileUpload
           onFilesSelected={handleFilesSelected}
@@ -287,9 +241,29 @@ export default function App() {
 
         {processingPhase === "processing" && (
           <ProcessingStatus
-            currentStep={processingSteps[currentStep].label}
-            progress={processingSteps[currentStep].progress}
+            currentStep={statusMessage}
+            progress={progress}
           />
+        )}
+
+        {processingPhase === "error" && (
+          <div className="w-full max-w-7xl mx-auto px-8 py-8">
+            <div className="bg-white rounded-lg border border-red-200 p-6">
+              <h3 className="text-xl font-medium text-red-700 mb-2">
+                Ocurrió un error
+              </h3>
+              <p className="text-sm text-[#666666] mb-6">
+                {statusMessage}. Revisa que el backend esté corriendo
+                y que hayas iniciado sesión en NotebookLM.
+              </p>
+              <button
+                onClick={handleClear}
+                className="px-8 py-3 bg-[#205DF5] text-white rounded-lg hover:bg-opacity-90 transition-all"
+              >
+                Volver a empezar
+              </button>
+            </div>
+          </div>
         )}
 
         {processingPhase === "completed" && (
@@ -306,8 +280,7 @@ export default function App() {
                   Descargar resultados
                 </h3>
                 <p className="text-sm text-[#666666] mb-6">
-                  Formato corporativo SONDA: Word, Excel, PDF o
-                  ZIP.
+                  Documentos generados en formato Word (.docx).
                 </p>
                 <button
                   onClick={() => setShowDownloadModal(true)}
@@ -322,6 +295,7 @@ export default function App() {
 
         <DownloadModal
           isOpen={showDownloadModal}
+          files={results}
           onClose={() => setShowDownloadModal(false)}
           onDownload={handleDownloadFromModal}
         />

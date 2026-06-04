@@ -2,21 +2,24 @@
 """
 licitacion_a_propuesta.py
 
-Script simple que automatiza el flujo de NotebookLM (librería de Teng Lin,
+Lógica central que automatiza el flujo de NotebookLM (librería de Teng Lin,
 notebooklm-py) para procesar los documentos de una licitación:
 
   1. Crea un notebook y sube los documentos (PDFs).
   2. Envía el primer mensaje: pide la lista completa de ítems/requisitos.
   3. Espera la respuesta.
   4. Envía el segundo mensaje: pide redactar la propuesta del oferente.
-  5. Guarda la respuesta final como un .docx con formato bonito.
+  5. Guarda los resultados como .docx con formato bonito dentro de
+     Output/<ID-de-la-licitación>/.
 
-Uso:
+Se usa tanto desde la línea de comandos como desde el backend (server.py).
+
+Uso (CLI):
     python licitacion_a_propuesta.py
-    python licitacion_a_propuesta.py doc1.pdf doc2.pdf --salida propuesta.docx
+    python licitacion_a_propuesta.py doc1.pdf doc2.pdf
 
 Requisitos:
-    pip install "notebooklm-py[browser]" python-docx
+    pip install -r requirements.txt
     playwright install chromium
     notebooklm login        # autenticación con Google (una sola vez)
 """
@@ -24,6 +27,8 @@ Requisitos:
 import argparse
 import asyncio
 import datetime as _dt
+import re
+import unicodedata
 from pathlib import Path
 
 from notebooklm import NotebookLMClient
@@ -46,37 +51,115 @@ MENSAJE_2 = (
     "los puntos que piden y mantenga el orden requerido."
 )
 
-# Documentos por defecto (los que están en el repositorio).
+# Documentos por defecto (los que están en el repositorio). Solo se usan si se
+# invoca el CLI sin argumentos; el backend siempre recibe archivos subidos.
 DOCS_POR_DEFECTO = [
     "Bases_2378-57-L126.pdf",
     "decreto_exento_3892_O_243_obligacion_prs.pdf",
     "decreto_exento_3892_Torniquetes.pdf",
 ]
 
+# Carpeta raíz donde se guardan todos los resultados (una subcarpeta por licitación).
+OUTPUT_ROOT = "Output"
+
+
+# --------------------------------------------------------------------------- #
+# Identificación de la licitación
+# --------------------------------------------------------------------------- #
+
+# Formatos típicos de ID de licitación de Mercado Público (Chile), p. ej.:
+#   2378-57-L126, 1057823-9-LP24, 750-12-LE23
+_PATRON_ID_LICITACION = re.compile(r"\b\d{3,8}-\d{1,4}-[A-Z]{1,3}\d{1,4}\b")
+
+
+def _extraer_texto_pdf(ruta, max_paginas=6):
+    """Devuelve el texto de las primeras páginas de un PDF (o '' si no se puede)."""
+    try:
+        from pypdf import PdfReader
+
+        lector = PdfReader(str(ruta))
+        paginas = lector.pages[:max_paginas]
+        return "\n".join((p.extract_text() or "") for p in paginas)
+    except Exception:
+        return ""
+
+
+def extraer_id_licitacion(documentos):
+    """Busca el ID de la licitación dentro de los PDFs.
+
+    Devuelve el primer ID que calce con el formato de Mercado Público, o None
+    si no encuentra ninguno.
+    """
+    for ruta in documentos:
+        ruta = Path(ruta)
+        if ruta.suffix.lower() != ".pdf":
+            continue
+        # Primero probamos con el propio nombre del archivo (suele traer el ID).
+        m = _PATRON_ID_LICITACION.search(ruta.name)
+        if m:
+            return m.group(0)
+        # Si no, miramos dentro del contenido.
+        texto = _extraer_texto_pdf(ruta)
+        m = _PATRON_ID_LICITACION.search(texto)
+        if m:
+            return m.group(0)
+    return None
+
+
+def _sanitizar(nombre):
+    """Convierte un texto en un nombre de carpeta/archivo seguro."""
+    nombre = unicodedata.normalize("NFKD", nombre)
+    nombre = nombre.encode("ascii", "ignore").decode("ascii")
+    nombre = re.sub(r"[^\w\s.-]", "", nombre).strip()
+    nombre = re.sub(r"[\s]+", "_", nombre)
+    return nombre or "licitacion"
+
+
+def nombre_licitacion(documentos):
+    """Determina el nombre identificador de la licitación.
+
+    Usa el ID encontrado en los PDFs; si no encuentra ninguno, usa el nombre
+    (sin extensión) del primer documento.
+    """
+    lic_id = extraer_id_licitacion(documentos)
+    if lic_id:
+        return _sanitizar(lic_id)
+    if documentos:
+        return _sanitizar(Path(documentos[0]).stem)
+    return "licitacion"
+
 
 # --------------------------------------------------------------------------- #
 # Flujo principal contra NotebookLM
 # --------------------------------------------------------------------------- #
 
-async def procesar(documentos, nombre_notebook):
-    """Sube los documentos, manda los dos mensajes y devuelve la propuesta final."""
+def _noop(progreso, mensaje):  # callback de progreso por defecto
+    pass
+
+
+async def procesar(documentos, nombre_notebook, on_progress=_noop):
+    """Sube los documentos, manda los dos mensajes y devuelve (lista_items, propuesta)."""
     async with NotebookLMClient.from_storage() as client:
         # 1. Crear el notebook
+        on_progress(5, "Creando notebook")
         print(f"→ Creando notebook: {nombre_notebook!r}")
         nb = await client.notebooks.create(nombre_notebook)
         print(f"  notebook id: {nb.id}")
 
         # 2. Subir cada documento y esperar a que NotebookLM lo procese
-        for ruta in documentos:
+        total = max(len(documentos), 1)
+        for i, ruta in enumerate(documentos):
             ruta = Path(ruta)
             if not ruta.exists():
                 raise FileNotFoundError(f"No se encontró el documento: {ruta}")
+            on_progress(10 + int(40 * i / total), f"Subiendo {ruta.name}")
             print(f"→ Subiendo documento: {ruta.name}")
             source = await client.sources.add_file(nb.id, ruta)
             await client.sources.wait_until_ready(nb.id, source.id)
             print(f"  listo: {ruta.name}")
 
         # 3. Primer mensaje: lista de ítems requeridos
+        on_progress(55, "Extrayendo requerimientos de la licitación")
         print("→ Enviando primer mensaje (lista de ítems de la licitación)...")
         r1 = await _ask_con_reintentos(client, nb.id, MENSAJE_1)
         print("  respuesta 1 recibida.")
@@ -87,6 +170,7 @@ async def procesar(documentos, nombre_notebook):
         #    ("el output que acabas de darme"). NO reenviamos la respuesta
         #    anterior: hacerlo genera un prompt enorme que NotebookLM responde
         #    vacío (ChatResponseParseError).
+        on_progress(78, "Redactando la propuesta del oferente")
         print("→ Enviando segundo mensaje (redacción de la propuesta)...")
         r2 = await _ask_con_reintentos(client, nb.id, MENSAJE_2)
         print("  respuesta 2 recibida.")
@@ -112,6 +196,64 @@ async def _ask_con_reintentos(client, nb_id, mensaje, intentos=4):
             print(f"  respuesta vacía, reintentando en {espera}s "
                   f"(intento {intento}/{intentos - 1})...")
             await asyncio.sleep(espera)
+
+
+# --------------------------------------------------------------------------- #
+# Orquestación de alto nivel (usada por el CLI y por el backend)
+# --------------------------------------------------------------------------- #
+
+async def generar_propuesta(documentos, output_root=OUTPUT_ROOT, on_progress=_noop,
+                            nombre_notebook=None):
+    """Procesa la licitación de punta a punta y guarda los .docx.
+
+    Devuelve un dict con el id de la licitación, la carpeta de salida y la lista
+    de archivos generados (cada uno con id, título, descripción y ruta).
+    """
+    documentos = [Path(d) for d in documentos]
+
+    on_progress(2, "Identificando la licitación")
+    lic = nombre_licitacion(documentos)
+    if nombre_notebook is None:
+        nombre_notebook = f"Licitación {lic}"
+
+    carpeta = Path(output_root) / lic
+    carpeta.mkdir(parents=True, exist_ok=True)
+
+    lista_items, propuesta = await procesar(documentos, nombre_notebook, on_progress)
+
+    on_progress(92, "Generando documentos .docx")
+    fecha = _dt.date.today().strftime("%d/%m/%Y")
+
+    ruta_propuesta = carpeta / f"Propuesta_Tecnica_{lic}.docx"
+    guardar_docx("Propuesta Técnica del Oferente", propuesta, str(ruta_propuesta))
+
+    ruta_items = carpeta / f"Lista_Items_{lic}.docx"
+    guardar_docx("Ítems Requeridos por la Licitación", lista_items, str(ruta_items))
+
+    on_progress(100, "Proceso finalizado")
+
+    return {
+        "licitacion": lic,
+        "carpeta": str(carpeta),
+        "archivos": [
+            {
+                "id": "propuesta",
+                "title": "Propuesta técnica",
+                "description": "Propuesta técnica del oferente, punto por punto.",
+                "filename": ruta_propuesta.name,
+                "path": str(ruta_propuesta),
+                "date": fecha,
+            },
+            {
+                "id": "items",
+                "title": "Lista de ítems",
+                "description": "Ítems y condiciones requeridos por la licitación.",
+                "filename": ruta_items.name,
+                "path": str(ruta_items),
+                "date": fecha,
+            },
+        ],
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -224,27 +366,20 @@ def main():
         help="Documentos a subir (por defecto: los PDFs de la licitación en el repo).",
     )
     parser.add_argument(
-        "--salida",
-        default="propuesta_oferente.docx",
-        help="Ruta del .docx de salida (por defecto: propuesta_oferente.docx).",
-    )
-    parser.add_argument(
-        "--notebook",
-        default="Licitación - Propuesta oferente",
-        help="Nombre del notebook a crear en NotebookLM.",
+        "--output",
+        default=OUTPUT_ROOT,
+        help=f"Carpeta raíz de salida (por defecto: {OUTPUT_ROOT}).",
     )
     args = parser.parse_args()
 
-    lista_items, propuesta = asyncio.run(
-        procesar(args.documentos, args.notebook)
+    resultado = asyncio.run(
+        generar_propuesta(args.documentos, output_root=args.output)
     )
 
-    # Guardamos la propuesta final (output del segundo mensaje) en .docx
-    guardar_docx("Propuesta Técnica del Oferente", propuesta, args.salida)
-
-    # Guardamos también la lista de ítems por si es útil de referencia.
-    ruta_items = Path(args.salida).with_name("lista_items_licitacion.docx")
-    guardar_docx("Ítems Requeridos por la Licitación", lista_items, str(ruta_items))
+    print(f"\n✓ Licitación: {resultado['licitacion']}")
+    print(f"✓ Carpeta:   {resultado['carpeta']}")
+    for a in resultado["archivos"]:
+        print(f"  - {a['title']}: {a['path']}")
 
 
 if __name__ == "__main__":
