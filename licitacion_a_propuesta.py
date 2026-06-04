@@ -187,18 +187,46 @@ async def procesar(documentos, nombre_notebook, on_progress=_noop):
         return r1.answer, r2.answer
 
 
+def _excepciones_de_parseo():
+    """Devuelve la(s) excepción(es) de respuesta vacía/no parseable de notebooklm.
+
+    El nombre y la ubicación de esta excepción cambian entre versiones de
+    notebooklm-py, así que la buscamos de forma flexible y, si no existe,
+    caemos a la excepción base de la librería.
+    """
+    try:
+        import notebooklm.exceptions as exc
+    except Exception:
+        return (Exception,)
+
+    candidatos = [
+        "ChatResponseParseError", "ResponseParseError",
+        "ChatParseError", "ParseError",
+    ]
+    encontradas = tuple(
+        getattr(exc, n) for n in candidatos if isinstance(getattr(exc, n, None), type)
+    )
+    if encontradas:
+        return encontradas
+
+    # Fallback: la excepción base de la librería (reintentamos ante cualquier
+    # fallo de la API, que suele ser transitorio).
+    base = getattr(exc, "NotebookLMError", None)
+    return (base,) if isinstance(base, type) else (Exception,)
+
+
 async def _ask_con_reintentos(client, nb_id, mensaje, intentos=4):
     """Envía un mensaje al chat reintentando ante respuestas vacías/no parseables.
 
-    El error ChatResponseParseError suele ser intermitente (la API devuelve un
-    stream vacío). Reintentamos con backoff exponencial antes de fallar.
+    El error de parseo suele ser intermitente (la API devuelve un stream vacío).
+    Reintentamos con backoff exponencial antes de fallar.
     """
-    from notebooklm.exceptions import ChatResponseParseError
+    errores = _excepciones_de_parseo()
 
     for intento in range(1, intentos + 1):
         try:
             return await client.chat.ask(nb_id, mensaje)
-        except ChatResponseParseError:
+        except errores:
             if intento == intentos:
                 raise
             espera = 2 ** intento  # 2s, 4s, 8s...
