@@ -37,6 +37,12 @@ const POLL_MS = 1500;
 const sleep = (ms: number) =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
+// Log del frontend (visible en la consola del navegador).
+const log = (...args: unknown[]) =>
+  console.log("%c[licitación]", "color:#205DF5;font-weight:bold", ...args);
+const logErr = (...args: unknown[]) =>
+  console.error("%c[licitación]", "color:#e11d48;font-weight:bold", ...args);
+
 // Dispara la descarga de un .docx generado por el backend.
 function descargar(jobId: string, resultId: string) {
   const a = document.createElement("a");
@@ -62,6 +68,8 @@ export default function App() {
     useState(false);
   const [results, setResults] = useState<ResultItem[]>([]);
   const [jobId, setJobId] = useState<string | null>(null);
+  const [errorDetail, setErrorDetail] = useState("");
+  const [errorTrace, setErrorTrace] = useState<string | null>(null);
 
   const handleFilesSelected = (newFiles: File[]) => {
     const fileItems: FileItem[] = newFiles.map(
@@ -101,7 +109,21 @@ export default function App() {
     setProcessingPhase("processing");
     setProgress(0);
     setStatusMessage("Subiendo documentos");
+    setErrorDetail("");
+    setErrorTrace(null);
     setAllStatus("uploading");
+
+    const fallar = (detalle: string, trace: string | null = null) => {
+      logErr("Procesamiento fallido:", detalle);
+      if (trace) logErr(trace);
+      setErrorDetail(detalle);
+      setErrorTrace(trace);
+      setProcessingPhase("error");
+      setAllStatus("error");
+      toast.error("No se pudo completar el procesamiento", {
+        description: detalle,
+      });
+    };
 
     try {
       // 1. Subir los archivos y arrancar el trabajo en el backend.
@@ -109,26 +131,32 @@ export default function App() {
       files.forEach((f) => {
         if (f.file) formData.append("files", f.file, f.name);
       });
+      log(`Subiendo ${files.length} archivo(s) a /api/process...`);
 
       const res = await fetch("/api/process", {
         method: "POST",
         body: formData,
       });
       if (!res.ok) {
-        throw new Error(`El backend respondió ${res.status}`);
+        const texto = await res.text().catch(() => "");
+        fallar(`El backend respondió ${res.status}. ${texto}`.trim());
+        return;
       }
       const { job_id } = await res.json();
       setJobId(job_id);
       setAllStatus("processing");
+      log("Trabajo iniciado, job_id =", job_id);
 
       // 2. Polling del estado hasta que termine o falle.
       while (true) {
         await sleep(POLL_MS);
         const sres = await fetch(`/api/status/${job_id}`);
         if (!sres.ok) {
-          throw new Error(`Estado no disponible (${sres.status})`);
+          fallar(`Estado no disponible (HTTP ${sres.status})`);
+          return;
         }
         const estado = await sres.json();
+        log(`estado: ${estado.phase} ${estado.progress}% — ${estado.message}`);
         setProgress(estado.progress ?? 0);
         setStatusMessage(estado.message ?? "Procesando");
 
@@ -142,6 +170,7 @@ export default function App() {
           setResults(items);
           setAllStatus("ready");
           setProcessingPhase("completed");
+          log("Completado. Licitación:", estado.licitacion, items);
           toast.success("Documentos procesados correctamente", {
             description: `Licitación ${estado.licitacion}: entregables listos para descargar`,
             icon: (
@@ -152,16 +181,15 @@ export default function App() {
         }
 
         if (estado.phase === "error") {
-          throw new Error(estado.error ?? "Error desconocido");
+          fallar(estado.error ?? "Error desconocido", estado.trace ?? null);
+          return;
         }
       }
     } catch (err) {
-      setProcessingPhase("error");
-      setAllStatus("error");
-      toast.error("No se pudo completar el procesamiento", {
-        description:
-          err instanceof Error ? err.message : String(err),
-      });
+      // Error de red / fetch (típicamente el backend no está corriendo).
+      fallar(
+        err instanceof Error ? err.message : String(err),
+      );
     }
   };
 
@@ -172,6 +200,8 @@ export default function App() {
     setProgress(0);
     setResults([]);
     setJobId(null);
+    setErrorDetail("");
+    setErrorTrace(null);
     toast.info("Selección limpiada");
   };
 
@@ -252,10 +282,31 @@ export default function App() {
               <h3 className="text-xl font-medium text-red-700 mb-2">
                 Ocurrió un error
               </h3>
-              <p className="text-sm text-[#666666] mb-6">
-                {statusMessage}. Revisa que el backend esté corriendo
-                y que hayas iniciado sesión en NotebookLM.
+              <p className="text-sm text-[#666666] mb-4">
+                Revisa que el backend esté corriendo y que hayas
+                iniciado sesión en NotebookLM (
+                <code>notebooklm login</code>).
               </p>
+              {errorDetail && (
+                <div className="mb-4">
+                  <p className="text-sm font-medium text-red-700 mb-1">
+                    Detalle:
+                  </p>
+                  <pre className="text-xs bg-red-50 text-red-800 rounded p-3 overflow-auto whitespace-pre-wrap">
+                    {errorDetail}
+                  </pre>
+                </div>
+              )}
+              {errorTrace && (
+                <details className="mb-4">
+                  <summary className="text-sm text-[#666666] cursor-pointer">
+                    Ver traza técnica completa
+                  </summary>
+                  <pre className="text-xs bg-[#1e1e1e] text-[#e4e4e4] rounded p-3 overflow-auto whitespace-pre-wrap mt-2">
+                    {errorTrace}
+                  </pre>
+                </details>
+              )}
               <button
                 onClick={handleClear}
                 className="px-8 py-3 bg-[#205DF5] text-white rounded-lg hover:bg-opacity-90 transition-all"

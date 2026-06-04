@@ -21,7 +21,9 @@ Ejecutar:
 """
 
 import asyncio
+import logging
 import shutil
+import traceback
 import uuid
 from pathlib import Path
 
@@ -30,6 +32,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 import licitacion_a_propuesta as core
+
+# --------------------------------------------------------------------------- #
+# Logging: a consola y a backend.log
+# --------------------------------------------------------------------------- #
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("backend.log", encoding="utf-8"),
+    ],
+)
+log = logging.getLogger("licitacion.backend")
 
 app = FastAPI(title="Licitación → Propuesta")
 
@@ -69,8 +84,11 @@ async def _ejecutar(job_id, documentos):
     def on_progress(progreso, mensaje):
         estado["progress"] = progreso
         estado["message"] = mensaje
+        log.info("[%s] %3d%% — %s", job_id, progreso, mensaje)
 
     try:
+        log.info("[%s] Iniciando procesamiento de %d documento(s)",
+                 job_id, len(documentos))
         resultado = await core.generar_propuesta(documentos, on_progress=on_progress)
         estado["licitacion"] = resultado["licitacion"]
         estado["paths"] = {a["id"]: a["path"] for a in resultado["archivos"]}
@@ -81,9 +99,14 @@ async def _ejecutar(job_id, documentos):
         estado["phase"] = "completed"
         estado["progress"] = 100
         estado["message"] = "Proceso finalizado"
+        log.info("[%s] Completado. Licitación=%s, carpeta=%s",
+                 job_id, resultado["licitacion"], resultado["carpeta"])
     except Exception as exc:  # noqa: BLE001 — queremos reportar cualquier fallo
+        tb = traceback.format_exc()
+        log.error("[%s] Falló el procesamiento:\n%s", job_id, tb)
         estado["phase"] = "error"
-        estado["error"] = str(exc)
+        estado["error"] = f"{type(exc).__name__}: {exc}"
+        estado["trace"] = tb
         estado["message"] = "Ocurrió un error al procesar"
 
 
@@ -103,6 +126,9 @@ async def process(files: list[UploadFile]):
         with destino.open("wb") as f:
             shutil.copyfileobj(archivo.file, f)
         documentos.append(destino)
+
+    log.info("[%s] Recibidos %d archivo(s): %s", job_id, len(documentos),
+             ", ".join(d.name for d in documentos))
 
     # Lanzamos la tarea sin esperar a que termine.
     asyncio.create_task(_ejecutar(job_id, documentos))

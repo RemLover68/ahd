@@ -11,6 +11,9 @@ storage_state.json
 Output/
 *.docx
 
+# Logs
+*.log
+
 # --- Sistema ---
 .DS_Store
 Thumbs.db
