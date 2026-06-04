@@ -50,26 +50,41 @@ from notebooklm import NotebookLMClient
 # --------------------------------------------------------------------------- #
 
 # Fase 1: lista completa de ítems (igual que la versión original).
+# Directiva común: evita que NotebookLM se trabe en si los documentos son o no
+# "bases de licitación" (a veces son PID / términos de referencia) y pida
+# confirmación en vez de hacer la tarea. Se añade a todos los prompts.
+_DIRECTIVA = (
+    " IMPORTANTE: trabaja directamente con el contenido de los documentos "
+    "entregados, sean bases de licitación, términos de referencia o proyectos "
+    "de ingeniería de detalle (PID). Entrega de inmediato lo solicitado: NO "
+    "pidas confirmación, NO hagas preguntas de vuelta y NO comentes sobre la "
+    "naturaleza, tipo o destinatario de los documentos; usa lo que contienen."
+)
+
 MENSAJE_LISTA = (
-    "quiero que me hagas una lista de todos y cada uno de los ítems que pide "
-    "la licitación, todo lo requerido por el oferente y las condiciones. que "
-    "esté totalmente completo, revisado, ordenado según el orden requerido de "
-    "las secciones y que no falte ni se invente ninguno."
+    "quiero que me hagas una lista de todos y cada uno de los ítems, "
+    "requerimientos técnicos, equipos, funcionalidades, especificaciones y "
+    "condiciones que establecen los documentos para quien debe ejecutar la "
+    "obra/servicio. que esté totalmente completa, revisada, con cantidades, "
+    "normas y modelos cuando aparezcan, ordenada según el orden de las "
+    "secciones de los documentos y que no falte ni se invente ninguno."
+    + _DIRECTIVA
 )
 
 # Fase 2: índice de secciones (NotebookLM las define).
 MENSAJE_INDICE = (
     "A partir de las fuentes, dame únicamente el ÍNDICE de las secciones o "
-    "subsistemas que debe tener la propuesta técnica del oferente. Devuélvelo "
-    "como una lista numerada, una sección por línea, SOLO los títulos, sin "
-    "ninguna descripción, sin detalle y sin sub-puntos."
+    "subsistemas técnicos que cubren los documentos y que debe abordar la "
+    "propuesta técnica. Devuélvelo como una lista numerada, una sección por "
+    "línea, SOLO los títulos, sin ninguna descripción, sin detalle y sin "
+    "sub-puntos." + _DIRECTIVA
 )
 
 # Fase 6: resumen ejecutivo.
 MENSAJE_RESUMEN = (
     "Redacta un breve resumen ejecutivo (máximo 200 palabras) de la propuesta "
-    "técnica del oferente para esta licitación, destacando el alcance general y "
-    "los principales sistemas y equipos ofertados."
+    "técnica del oferente, destacando el alcance general y los principales "
+    "sistemas y equipos ofertados." + _DIRECTIVA
 )
 
 
@@ -79,9 +94,9 @@ def _prompt_requisitos(seccion):
         "Lista de forma exhaustiva y detallada TODOS los ítems, equipos, "
         "cantidades, marcas o modelos (si la fuente los indica), normas y "
         "estándares, valores numéricos, características técnicas y condiciones "
-        "que la licitación exige para esta sección. Un punto por requisito. No "
-        "resumas, no agrupes, no omitas ninguno y no inventes nada. Cita la "
-        "fuente cuando corresponda."
+        "que los documentos establecen para esta sección. Un punto por "
+        "requisito. No resumas, no agrupes, no omitas ninguno y no inventes "
+        "nada. Cita la fuente cuando corresponda." + _DIRECTIVA
     )
 
 
@@ -91,8 +106,9 @@ def _prompt_propuesta(seccion, requisitos):
         f"sección «{seccion}», respondiendo punto por punto a CADA uno de los "
         "siguientes requisitos. Usa un estilo propositivo: «se proveerá…», «se "
         "instalará…», «se ofertará…». Mantén todo el nivel de detalle "
-        "(cantidades, modelos, normas, valores) y no omitas ningún punto.\n\n"
-        "--- Requisitos de esta sección ---\n"
+        "(cantidades, modelos, normas, valores) y no omitas ningún punto."
+        + _DIRECTIVA +
+        "\n\n--- Requisitos de esta sección ---\n"
         f"{_truncar(requisitos)}"
     )
 
@@ -104,8 +120,9 @@ def _prompt_matriz(seccion, requisitos):
         "| Requisito | Cumplimiento | Referencia |\n"
         "Una fila por requisito. En 'Cumplimiento' indica cómo lo cumple el "
         "oferente (empieza con CUMPLE y una breve explicación). En 'Referencia' "
-        "indica la fuente. No omitas requisitos y responde SOLO con la tabla.\n\n"
-        "--- Requisitos de esta sección ---\n"
+        "indica la fuente. No omitas requisitos y responde SOLO con la tabla."
+        + _DIRECTIVA +
+        "\n\n--- Requisitos de esta sección ---\n"
         f"{_truncar(requisitos)}"
     )
 
@@ -226,13 +243,46 @@ def _excepciones_de_parseo():
     return (base,) if isinstance(base, type) else (Exception,)
 
 
-async def _ask(client, nb_id, mensaje, intentos=4):
-    """Envía un mensaje al chat reintentando ante respuestas vacías/no parseables."""
+# Marcadores de una respuesta "evasiva": NotebookLM, en vez de hacer la tarea,
+# pide confirmación o comenta que los documentos no son lo que cree el prompt.
+_MARCADORES_EVASION = (
+    "por favor confírma", "confírmamelo", "confírmame", "¿quieres que",
+    "¿deseas que", "¿te gustaría", "si tu objetivo es", "con gusto elaborar",
+    "no contienen las bases", "no corresponden a las bases", "puedo elaborar",
+    "házmelo saber", "avísame si", "me confirmas", "¿procedo",
+)
+# Confirmación que se manda para destrabar una respuesta evasiva.
+_MENSAJE_CONFIRMACION = (
+    "Sí, procede ahora. Entrega directamente y por completo el contenido "
+    "solicitado en mi mensaje anterior, sin pedir confirmación, sin hacer "
+    "preguntas y sin comentar sobre el tipo de documento."
+)
+
+
+def _es_evasiva(texto):
+    if not texto:
+        return False
+    t = texto.lower()
+    return any(m in t for m in _MARCADORES_EVASION)
+
+
+async def _ask(client, nb_id, mensaje, intentos=4, anti_evasion=True):
+    """Envía un mensaje al chat reintentando ante respuestas vacías/no parseables.
+
+    Si la respuesta resulta evasiva (pide confirmación en vez de hacer la tarea),
+    manda una confirmación y usa esa segunda respuesta.
+    """
     errores = _excepciones_de_parseo()
     for intento in range(1, intentos + 1):
         try:
             r = await client.chat.ask(nb_id, mensaje)
-            return r.answer
+            respuesta = r.answer
+            if anti_evasion and _es_evasiva(respuesta):
+                print("  ⚠ respuesta evasiva (pidió confirmación); insistiendo...")
+                r2 = await client.chat.ask(nb_id, _MENSAJE_CONFIRMACION)
+                if r2.answer and not _es_evasiva(r2.answer):
+                    return r2.answer
+            return respuesta
         except errores:
             if intento == intentos:
                 raise
@@ -272,7 +322,13 @@ def _parsear_indice(texto):
 def _leer_si_existe(ruta):
     p = Path(ruta)
     if p.exists() and p.stat().st_size > 0:
-        return p.read_text(encoding="utf-8")
+        texto = p.read_text(encoding="utf-8")
+        # Un checkpoint evasivo (NotebookLM pidió confirmación) se considera
+        # inválido, para que al reanudar se vuelva a pedir en lugar de heredarlo.
+        if _es_evasiva(texto):
+            print(f"  ⚠ checkpoint evasivo, se regenerará: {Path(ruta).name}")
+            return None
+        return texto
     return None
 
 
