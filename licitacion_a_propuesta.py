@@ -35,15 +35,15 @@ from notebooklm import NotebookLMClient
 MENSAJE_1 = (
     "quiero que me hagas una lista de todos y cada uno de los ítems que pide "
     "la licitación, todo lo requerido por el oferente y las condiciones. que "
-    "esté totalmente completo, revisado y no falte ni se invente ninguno."
+    "esté totalmente completo, revisado, ordenado según el orden requerido de las secciones y que no falte ni se invente ninguno."
 )
 
 MENSAJE_2 = (
-    "ok ahroa quiero que tomes el output que acabas de darme y escribas una "
+    "ok ahora quiero que tomes el output que acabas de darme y escribas una "
     "propuesta desde el punto de vista del oferente: si pide que se suministre "
     "x cosa, que se haga una propuesta que diga por ejemplo \"se oferta...\" "
     "\"se instalarán...\" \"se proveerá...\" y que cuente con cada uno de todos "
-    "los puntos que piden."
+    "los puntos que piden y mantenga el orden requerido."
 )
 
 # Documentos por defecto (los que están en el repositorio).
