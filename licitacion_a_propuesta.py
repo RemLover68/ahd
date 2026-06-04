@@ -78,22 +78,40 @@ async def procesar(documentos, nombre_notebook):
 
         # 3. Primer mensaje: lista de ítems requeridos
         print("→ Enviando primer mensaje (lista de ítems de la licitación)...")
-        r1 = await client.chat.ask(nb.id, MENSAJE_1)
+        r1 = await _ask_con_reintentos(client, nb.id, MENSAJE_1)
         print("  respuesta 1 recibida.")
 
         # 4. Segundo mensaje: redactar la propuesta del oferente.
-        #    Se incluye la respuesta anterior como contexto para que el modelo
-        #    no dependa del historial (la API puede ser stateless).
+        #    El chat de NotebookLM mantiene el contexto de la conversación dentro
+        #    del mismo notebook, así que basta con mandar el mensaje tal cual
+        #    ("el output que acabas de darme"). NO reenviamos la respuesta
+        #    anterior: hacerlo genera un prompt enorme que NotebookLM responde
+        #    vacío (ChatResponseParseError).
         print("→ Enviando segundo mensaje (redacción de la propuesta)...")
-        mensaje_2 = (
-            f"{MENSAJE_2}\n\n"
-            "--- Lista de ítems entregada anteriormente ---\n"
-            f"{r1.answer}"
-        )
-        r2 = await client.chat.ask(nb.id, mensaje_2)
+        r2 = await _ask_con_reintentos(client, nb.id, MENSAJE_2)
         print("  respuesta 2 recibida.")
 
         return r1.answer, r2.answer
+
+
+async def _ask_con_reintentos(client, nb_id, mensaje, intentos=4):
+    """Envía un mensaje al chat reintentando ante respuestas vacías/no parseables.
+
+    El error ChatResponseParseError suele ser intermitente (la API devuelve un
+    stream vacío). Reintentamos con backoff exponencial antes de fallar.
+    """
+    from notebooklm.exceptions import ChatResponseParseError
+
+    for intento in range(1, intentos + 1):
+        try:
+            return await client.chat.ask(nb_id, mensaje)
+        except ChatResponseParseError:
+            if intento == intentos:
+                raise
+            espera = 2 ** intento  # 2s, 4s, 8s...
+            print(f"  respuesta vacía, reintentando en {espera}s "
+                  f"(intento {intento}/{intentos - 1})...")
+            await asyncio.sleep(espera)
 
 
 # --------------------------------------------------------------------------- #
