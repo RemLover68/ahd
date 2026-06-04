@@ -139,7 +139,16 @@ def _noop(progreso, mensaje):  # callback de progreso por defecto
 
 async def procesar(documentos, nombre_notebook, on_progress=_noop):
     """Sube los documentos, manda los dos mensajes y devuelve (lista_items, propuesta)."""
-    async with NotebookLMClient.from_storage() as client:
+    # Según la versión de notebooklm-py, from_storage() puede ser síncrono (devuelve
+    # el cliente/context manager directo) o asíncrono (devuelve una corrutina que hay
+    # que await-ear). Soportamos ambos casos.
+    import inspect
+
+    cliente_cm = NotebookLMClient.from_storage()
+    if inspect.iscoroutine(cliente_cm):
+        cliente_cm = await cliente_cm
+
+    async with cliente_cm as client:
         # 1. Crear el notebook
         on_progress(5, "Creando notebook")
         print(f"→ Creando notebook: {nombre_notebook!r}")
