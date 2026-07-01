@@ -1,0 +1,10 @@
+packages:
+  - '.'
+allowBuilds:
+  '@tailwindcss/oxide': set this to true or false
+  esbuild: set this to true or false
+onlyBuiltDependencies:
+  - '@tailwindcss/oxide'
+  - esbuild
+overrides:
+  vite: 6.3.5

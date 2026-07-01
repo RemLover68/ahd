@@ -1,0 +1,19 @@
+# --- Backend (Python) ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+storage_state.json
+.notebooklm/
+
+# Resultados generados y subidas temporales
+Output/
+*.docx
+
+# Logs
+*.log
+
+# --- Sistema ---
+.DS_Store
+Thumbs.db
