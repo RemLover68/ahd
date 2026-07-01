@@ -1,6 +1,10 @@
-notebooklm-py[browser]
+openai>=1.40.0
+sentence-transformers>=3.0.1
+numpy>=1.26.4
 python-docx
 pypdf
 fastapi
 uvicorn[standard]
 python-multipart
+markitdown[pdf]
+docling

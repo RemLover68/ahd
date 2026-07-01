@@ -1,98 +1,176 @@
-# Licitación → Propuesta (NotebookLM)
+# Licitacion -> Propuesta (RAG local)
 
-App que automatiza NotebookLM (usando la librería **notebooklm-py** de Teng Lin)
-para procesar los documentos de una licitación y generar una propuesta del
-oferente en formato `.docx`, con un frontend web para manejarlo cómodamente.
+App local-first para procesar documentos de una licitacion, extraer una lista de
+items y generar una propuesta tecnica con citas trazables.
 
-## ¿Qué hace?
+El backend ahora usa:
 
-1. Subes los documentos de la licitación desde la web (o por CLI).
-2. Crea un notebook en NotebookLM y sube los documentos.
-3. Ejecuta un **pipeline por secciones con checkpoints** (en vez de pedir todo
-   en un solo turno, que da respuestas poco profundas):
-   - **Fase 1:** lista completa de ítems / requisitos.
-   - **Fase 2:** índice de secciones (lo define NotebookLM).
-   - **Fase 3–5:** por cada sección → requisitos exhaustivos, propuesta del
-     oferente y matriz de cumplimiento (cada uno guardado como checkpoint).
-   - **Fase 6:** resumen ejecutivo y ensamblado de los `.docx`.
-4. Guarda los resultados en **`Output/<ID-de-la-licitación>/`**:
-   - `Propuesta_Tecnica_<ID>.docx`
-   - `Lista_Items_<ID>.docx`
-   - `Matriz_Cumplimiento_<ID>.docx`
-   - `checkpoints/` con todos los intermedios (auditables / regenerables).
+- un servidor LLM local OpenAI-compatible
+- Docling para OCR/parseo cuando esta disponible
+- embeddings locales y busqueda hibrida para RAG
+- checkpoints por fase
+- exportacion a `.docx`
 
-El **nombre de la subcarpeta** es el ID de la licitación detectado en los PDFs
-(formato Mercado Público, p. ej. `2378-57-L126`). Si no se encuentra ninguno,
-usa el nombre del primer archivo subido.
+`Open WebUI` puede usarse como interfaz opcional para explorar el corpus local,
+pero el flujo productivo de licitaciones vive en este backend.
 
-## Estructura
+## Que hace
 
-```
-.
-├── server.py                  # Backend HTTP (FastAPI)
-├── licitacion_a_propuesta.py  # Lógica central + CLI
-├── requirements.txt           # Dependencias del backend
-├── Output/                     # Resultados generados (ignorado por git)
-└── Frontend/                   # Frontend web (React + Vite + shadcn)
-```
+1. Carga los documentos de la licitacion desde la web o por CLI.
+2. Convierte PDFs y otros formatos a texto utilizable para RAG.
+3. Construye un corpus local con embeddings.
+4. Extrae una lista consolidada de items:
+   - Hardware
+   - Software
+   - Otros
+5. Propone el indice de secciones de la propuesta tecnica.
+6. Genera, por seccion, requisitos y propuesta con citas `[n]`.
+7. Produce un resumen ejecutivo.
+8. Guarda resultados en `Output/<ID-de-la-licitacion>/` y exporta `.docx`.
 
-## Requisitos previos (una sola vez)
+## Arquitectura
+
+- `server.py` expone la API HTTP para el frontend.
+- `licitacion_a_propuesta.py` contiene el pipeline local RAG y la exportacion.
+- `Frontend/` muestra progreso, resultado y re-procesado selectivo.
+
+## Requisitos
+
+- Ubuntu 22.04+ o similar
+- Python 3.11+
+- Un servidor LLM local OpenAI-compatible
+- Un modelo cuantizado de 27B a 32B como objetivo principal
+
+### Modelos recomendados
+
+Para esta maquina, el objetivo razonable es la banda 27B-32B:
+
+- `Gemma 4 31B Dense` como candidato principal si tu runtime lo soporta.
+- `Qwen3-32B-Instruct` como alternativa generalista muy fuerte.
+- `DeepSeek-R1-Distill-Qwen-32B` como opcion de razonamiento.
+
+Si el modelo es demasiado pesado, baja a una variante cuantizada mas agresiva
+o cambia a un runtime local con mejor offload de CPU/RAM.
+
+## Variables de entorno
+
+El backend se configura con estas variables:
+
+- `LOCAL_LLM_BASE_URL` -> endpoint OpenAI-compatible local
+- `LOCAL_LLM_API_KEY` -> clave dummy o la que pida tu servidor
+- `LOCAL_LLM_MODEL` -> nombre exacto del modelo local
+- `LOCAL_LLM_TIMEOUT` -> timeout de peticiones al modelo
+- `LOCAL_LLM_MAX_CONCURRENCY` -> concurrencia de llamadas al modelo
+- `RAG_EMBED_MODEL` -> modelo de embeddings local
+- `RAG_TOP_K` -> numero de fragmentos recuperados por consulta
+- `RAG_CHUNK_SIZE` -> tamano de chunk
+- `RAG_CHUNK_OVERLAP` -> solape entre chunks
+- `RAG_EMBED_BATCH` -> batch de embeddings
+- `RAG_HYBRID_WEIGHT` -> peso de embeddings frente a coincidencia lexica
+- `JOB_EXECUTION_LIMIT` -> cantidad de trabajos simultaneos
+
+Valores sugeridos para empezar:
 
 ```bash
-# Backend (dentro de un entorno virtual .venv)
-python -m venv .venv
-# Windows:        .\.venv\Scripts\activate
-# Linux/macOS:    source .venv/bin/activate
+export LOCAL_LLM_BASE_URL="http://127.0.0.1:11434/v1"
+export LOCAL_LLM_API_KEY="local"
+export LOCAL_LLM_MODEL="qwen3:14b"
+export RAG_EMBED_MODEL="BAAI/bge-m3"
+export RAG_HYBRID_WEIGHT=0.75
+export JOB_EXECUTION_LIMIT=2
+export LOCAL_LLM_MAX_CONCURRENCY=2
+```
+
+## Instalacion
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-playwright install chromium
-notebooklm login        # inicia sesión con Google
-
-# Frontend
-cd Frontend
-pnpm install            # o npm install
 ```
 
-## Uso con la web (frontend + backend)
+Instala y levanta tu servidor LLM local preferido antes de procesar.
 
-En una terminal, **con el `.venv` activado** y desde la raíz del repo, levanta
-el backend (no requiere Docker):
+`docling` habilita parseo estructurado y OCR local. Si falla o no esta
+instalado, el pipeline cae a `pypdf`/`markitdown`, con menor calidad en PDFs
+escaneados.
+
+## Uso con la web
+
+Backend:
 
 ```bash
-# Windows:        .\.venv\Scripts\activate
-# Linux/macOS:    source .venv/bin/activate
-uvicorn server:app --reload --port 8000
+source .venv/bin/activate
+uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
-> Importante: activa el `.venv` antes de `uvicorn`, si no usará un Python sin
-> las dependencias. El backend escribe sus logs en consola y en `backend.log`.
-
-En otra, levanta el frontend:
+Frontend:
 
 ```bash
 cd Frontend
-pnpm dev                # o npm run dev
+pnpm install
+pnpm dev -- --host 0.0.0.0
 ```
 
-Abre la URL que muestra Vite (normalmente http://localhost:5173). Vite reenvía
-automáticamente las llamadas `/api` al backend (ver `Frontend/vite.config.ts`).
+Abre la URL que imprime Vite.
 
-Flujo: subes los documentos → "Procesar documentos" → se muestra el progreso →
-al terminar descargas la propuesta técnica y la lista de ítems.
+### Windows: un solo script
 
-## Uso solo por CLI (sin frontend)
+`start.bat` en la raiz del repo levanta ambos servicios de una vez: instala
+dependencias del Frontend si falta `node_modules`, abre el frontend (`pnpm dev`)
+en una ventana nueva y corre el backend (`uvicorn --reload --port 8000`) en la
+ventana actual.
+
+```bat
+start.bat
+```
+
+## Open WebUI
+
+Si quieres una interfaz adicional para hablar con el mismo stack local, puedes
+levantar `Open WebUI` y apuntarlo al mismo backend LLM local.
+
+La integracion tipica es:
+
+- tu runtime local expone un endpoint OpenAI-compatible
+- `Open WebUI` se conecta a ese endpoint
+- este repo usa el mismo endpoint para el pipeline de licitaciones
+
+## Uso solo por CLI
 
 ```bash
 python licitacion_a_propuesta.py bases.pdf anexo.pdf
 ```
 
-Los resultados quedan en `Output/<ID-de-la-licitación>/`.
+Los resultados quedan en `Output/<ID-de-la-licitacion>/`.
 
-| Opción      | Descripción                          | Por defecto |
-|-------------|--------------------------------------|-------------|
-| `documentos`| Archivos a subir                     | Los PDFs del repo |
-| `--output`  | Carpeta raíz de salida               | `Output`    |
+## API
 
-## Nota
+| Endpoint | Descripcion |
+|---|---|
+| `POST /api/process` | Sube archivos y lanza el pipeline |
+| `GET /api/status/{job_id}` | Progreso y fase |
+| `GET /api/result/{job_id}` | JSON estructurado con secciones y citas |
+| `POST /api/reprocess` | Re-procesa secciones especificas |
+| `GET /api/reprocess-status/{id}` | Estado del re-proceso |
+| `GET /api/export/{job_id}` | Genera y descarga el `.docx` actual |
+| `GET /api/download/{job_id}/{id}` | Descarga un `.docx` generado |
+| `GET /api/health` | Health check |
 
-`notebooklm-py` es una librería **no oficial** que usa APIs internas de Google,
-así que puede dejar de funcionar si Google cambia algo de su lado.
+## Salida
+
+Cada trabajo deja:
+
+- `result.json` como fuente de verdad
+- `result_v<n>.json` para historial
+- `checkpoints/` con los textos intermedios
+- `Propuesta_Tecnica_<ID>.docx`
+- `Lista_Items_<ID>.docx`
+
+## Notas
+
+- El visor conserva las citas `[n]` y el re-procesado selectivo.
+- Si el modelo omite marcadores de cita, el backend agrega citas visibles a las
+  lineas sustantivas usando la evidencia recuperada.
+- El pipeline no depende de servicios cloud.
+- La calidad final depende de la combinacion entre el modelo local y el RAG.
